@@ -1,0 +1,132 @@
+# live-transcript-cloud-worker configuration.
+# Copy to config/config.yaml (or run `uv run main.py <name>.yaml`).
+# Secrets may instead come from env vars:
+#   LT_SERVER_API_KEY, DEEPGRAM_API_KEY, CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID
+
+server:
+  # Shared worker credential, sent as X-API-Key on every request.
+  apiKey: ""
+
+  # Base URL of live-transcript-server.
+  url: https://example.com
+
+  # false = don't talk to the server; write transcripts to
+  # tmp/{key}/transcript.text instead. Essential for local development.
+  enabled: true
+
+  # Target chunk/line duration in seconds (ffmpeg -segment_time).
+  buffer_size_seconds: 6
+
+  # YouTube only: use the fragment-based DASH live-from-start strategy,
+  # captures the stream from second zero with exact (vodAccurate) timestamps,
+  # falling back to live-edge if it fails or falls too far behind.
+  # NOTE: DASH must be turned OFF when cookies are enabled, a
+  # --live-from-start backfill is a long-lived authenticated download burst,
+  # exactly the pattern that gets accounts flagged. The config refuses to
+  # start with both enabled. Twitch always captures at the live edge.
+  use_dash_for_youtube: false
+
+  # Concurrent media uploads (shared across channels, round-robin fair).
+  media_upload_concurrency: 3
+
+  incoming_polling:
+    # true = ignore streamers[].urls; take URLs from GET /{key}/incoming.
+    enabled: false
+    interval_seconds: 30
+    # Consecutive "confirmed offline" probes before a queued URL is removed.
+    offline_delete_threshold: 2
+
+  events_polling:
+    enabled: true
+    # Held-open duration for GET /events; server clamps to [0, 60].
+    wait_seconds: 25
+    # Safety-net /incoming refresh cadence while events polling works.
+    fallback_interval_seconds: 300
+
+  channel_polling:
+    # Baseline seconds between liveness probes per URL (yt-dlp -j is
+    # expensive; keep this modest or the platform rate-limits you).
+    interval_seconds: 60
+    # Cap for far-future schedules and confirmed-offline URLs.
+    max_interval_seconds: 9000
+    # Wake this many seconds before a scheduled start.
+    pre_scheduled_buffer_seconds: 300
+
+  cookies:
+    # Pass --cookies to yt-dlp (Netscape-format files at the project root).
+    # Needed when running from datacenter IPs; leave disabled on a
+    # residential connection. Twitch never gets cookies (it doesn't need
+    # them); these apply to YouTube and other platforms.
+    enabled: false
+    # Separate files so the polling cookie and the download cookie can be
+    # rotated/scoped independently. May point at the same file.
+    check_filename: cookies.txt
+    download_filename: cookies.txt
+
+  stale_threshold:
+    # DASH only: wait this long for a fragment sequence's tracks to complete
+    # before emitting it with partial data.
+    fragment_seconds: 60
+    # DASH only: falling this far behind live switches to live-edge capture
+    # for the rest of the stream (also the pre-flight catch-up cutoff).
+    lfs_gap_seconds: 600
+    # No new segment/fragment for this long => terminate a wedged yt-dlp.
+    ytdlp_seconds: 180
+
+capture:
+  # Paths to external binaries (absolute, or resolved on PATH).
+  yt_dlp_path: yt-dlp
+  ffmpeg_path: ffmpeg
+  # Live-edge timestamp anchor: segment_mtime - duration - this.
+  live_latency_seconds: 1
+  # Process-wide cap on concurrent yt-dlp -j probes.
+  probe_concurrency: 4
+  probe_timeout_seconds: 30
+
+transcription:
+  # Which registered provider to use. Built-in: deepgram | cloudflare.
+  # New providers are one module in live_transcript_cloud_worker/providers/
+  # (see providers/base.py); their options go in a section named after them,
+  # exactly like the deepgram/cloudflare blocks below.
+  provider: deepgram
+  # Optional second provider tried when the primary exhausts its retries.
+  # Leave empty to disable. Requires that provider's credentials too.
+  fallback_provider: ""
+  language: en
+  # Per-channel in-flight transcription requests. Results are re-ordered
+  # before line submission, so this only affects throughput, not ordering.
+  concurrency: 2
+  request_timeout_seconds: 30
+  max_retries: 4
+  # Chunks measured shorter than this emit no line (typically ad breaks).
+  min_chunk_seconds: 0.5
+
+  deepgram:
+    # nova-3 pre-recorded (~$0.0043/audio-minute pay-as-you-go).
+    api_key: ""
+    model: nova-3
+    smart_format: true
+    filler_words: false
+    # Up to ~50 domain terms to boost (names, jargon). Nova-3 keyterm.
+    keyterms: []
+
+  cloudflare:
+    # Workers AI whisper ($0.0005/audio-minute for large-v3-turbo).
+    # Token needs the "Workers AI" permission template.
+    account_id: ""
+    api_token: ""
+    model: "@cf/openai/whisper-large-v3-turbo"
+    # Voice-activity-detection preprocessing; mitigates whisper's
+    # hallucination-on-silence failure mode.
+    vad_filter: true
+
+streamers:
+  - key: example # must match a channel key in the server config
+    urls: # ignored when incoming_polling.enabled
+      - https://www.youtube.com/@example/live
+      - https://www.twitch.tv/example
+    active: true
+    media_type: none # none | audio | video
+
+# Stream IDs never to transcribe (e.g. a 24/7 loop).
+id_blacklist: []

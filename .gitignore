@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# Worker runtime state
+tmp/
+config/*.yaml
+!config/example.yaml
+cookies*.txt
+
+# OS
+.DS_Store
+junit.xml

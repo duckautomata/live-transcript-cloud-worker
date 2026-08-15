@@ -1,0 +1,35 @@
+[project]
+name = "live-transcript-cloud-worker"
+version = "0.1.0"
+description = "Cloud live-transcript worker: yt-dlp capture + remote transcription (Cloudflare Workers AI / Deepgram)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "pyyaml>=6.0.3",
+]
+
+[dependency-groups]
+dev = [
+    "pyrefly>=1.1.1",
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.15.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 140
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pyrefly]
+python-version = "3.12"
+project-includes = ["live_transcript_cloud_worker", "main.py"]

@@ -1,0 +1,19 @@
+services:
+  worker:
+    # Remove `build:` to run the published image instead of a local build.
+    build: .
+    image: duckautomata/live-transcript-cloud-worker:latest
+    restart: always
+    environment:
+      # Secrets stay out of the mounted config.
+      LT_SERVER_API_KEY: ${LT_SERVER_API_KEY:-}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN:-}
+      CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID:-}
+    volumes:
+      - ./config.yaml:/app/config/config.yaml:ro,z
+      # Netscape-format cookie files (server.cookies in config). Create the
+      # files before `up`, or compose creates them as directories.
+      - ./cookies.txt:/app/cookies.txt:z
+      # Per-channel durable state + pending media survive restarts.
+      - ./tmp:/app/tmp:z
