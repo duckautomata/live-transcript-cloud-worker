@@ -23,6 +23,43 @@ _BEGIN_IN_RE = re.compile(r"will begin in ([^.]+)")
 _DURATION_PART_RE = re.compile(r"(\d+)\s+(day|hour|minute|second)s?")
 _UNIT_SECONDS = {"day": 86400, "hour": 3600, "minute": 60, "second": 1}
 
+# yt-dlp stamps live titles with the time the metadata was fetched
+# ("<title> 2026-08-12 17:38"), which would otherwise churn the stream title
+# on every reactivation. Only *trailing* stamps are stripped: a date in the
+# middle (or at the start) of a title is the broadcaster's own text.
+_STAMP = r"""
+    (?:
+        \d{4}-\d{2}-\d{2}                     # 2026-08-12
+        (?:[\sT,]+\d{1,2}:\d{2}(?::\d{2})?)?  #  optionally 17:38(:09)
+      | \d{1,2}/\d{1,2}/\d{2,4}               # 12/08/2026
+        (?:[\s,]+\d{1,2}:\d{2}(?::\d{2})?)?
+      | \d{1,2}:\d{2}(?::\d{2})?              # bare 17:38
+    )
+    (?:\s*(?:[AaPp]\.?[Mm]\.?\b|[A-Z]{2,5}\b))?  # optional am/pm or timezone
+"""
+_SEP = r"[\s\-–—|,]*"
+# Bracketed form first ("Title (2026-08-12 17:38)"): the brackets only count
+# as part of the stamp when they wrap it, so "... (Part 1) 12:00" keeps its
+# parenthesis.
+_BRACKETED_STAMP_RE = re.compile(rf"{_SEP}[(\[]\s*{_STAMP}\s*[)\]]\s*$", re.VERBOSE)
+# One stamp only: yt-dlp appends exactly one, and a greedy repeat would also
+# swallow a time the broadcaster wrote ("karaoke 21:00 JST 2026-08-12 17:38").
+_TRAILING_STAMP_RE = re.compile(rf"{_SEP}{_STAMP}{_SEP}$", re.VERBOSE)
+
+
+def strip_trailing_timestamp(title: str) -> str:
+    """Drop the date/time yt-dlp appends to live stream titles.
+
+    A title that is *only* a stamp is left alone: an empty title is worse
+    than a noisy one.
+    """
+    cleaned = title.strip()
+    stripped = _BRACKETED_STAMP_RE.sub("", cleaned)
+    if stripped == cleaned:
+        stripped = _TRAILING_STAMP_RE.sub("", cleaned)
+    stripped = stripped.strip()
+    return stripped or cleaned
+
 
 def platform_of(url: str) -> Platform:
     lowered = url.lower()
@@ -109,7 +146,7 @@ def _info_from_metadata(url: str, metadata: dict) -> StreamInfo:
     return StreamInfo(
         url=url,
         stream_id=str(metadata.get("id", "")),
-        title=title or "untitled",
+        title=strip_trailing_timestamp(title) or "untitled",
         is_live=is_live,
         live_status=live_status,
         scheduled_start=int(scheduled) if scheduled else None,

@@ -65,6 +65,10 @@ class ChannelWatcher:
         self._schedules: dict[str, _UrlSchedule] = {}
         self._incoming_mode = config.server.incoming_polling.enabled
         self._last_incoming_refresh = 0.0
+        # A stream whose deactivate never landed: the server still shows the
+        # channel live, so the next chance (URL removal, restart, shutdown)
+        # retries it.
+        self._pending_deactivate = ""
         if not self._incoming_mode:
             for url in streamer.urls:
                 self._schedules[url] = _UrlSchedule()
@@ -100,6 +104,30 @@ class ChannelWatcher:
         else:
             schedule.next_check = now + self._jittered_interval()
 
+    # --------------------------------------------------------- deactivation
+
+    async def _deactivate(self, stream_id: str) -> None:
+        """Deactivate one stream and clear the local live flag.
+
+        A failed call is remembered rather than forgotten: a channel left
+        marked live on the server never self-heals otherwise.
+        """
+        if not stream_id:
+            return
+        ok = await self.server.deactivate(self.streamer.key, stream_id)
+        self._pending_deactivate = "" if ok else stream_id
+        self.state.set_live(False)
+
+    async def _deactivate_current(self, reason: str) -> None:
+        """Deactivate whatever the server may still consider live on this
+        channel. A no-op when there is nothing outstanding, so callers can
+        use it as a belt-and-braces step without generating traffic."""
+        stream_id = self.state.stream_id if self.state.is_live else self._pending_deactivate
+        if not stream_id:
+            return
+        logger.info("[%s] deactivating %s (%s)", self.streamer.key, stream_id, reason)
+        await self._deactivate(stream_id)
+
     # ------------------------------------------------------------- incoming
 
     async def _refresh_incoming(self) -> None:
@@ -110,8 +138,15 @@ class ChannelWatcher:
         for url in current - known:
             logger.info("[%s] incoming URL queued: %s", self.streamer.key, url)
             self._schedules[url] = _UrlSchedule()  # next_check=0 -> immediate
-        for url in known - current:
+        dropped = known - current
+        for url in dropped:
+            logger.info("[%s] incoming URL removed server-side: %s", self.streamer.key, url)
             del self._schedules[url]
+        if dropped:
+            # The queue entry is gone, so nothing will re-capture this
+            # channel's stream: make sure the server isn't left showing it
+            # live (docs/02). Usually already deactivated -> no request.
+            await self._deactivate_current("incoming URL removed server-side")
 
     def _incoming_fallback_elapsed(self) -> bool:
         events = self.config.server.events_polling
@@ -120,6 +155,10 @@ class ChannelWatcher:
 
     async def _drop_incoming_url(self, url: str) -> None:
         logger.info("[%s] removing offline URL from incoming queue: %s", self.streamer.key, url)
+        # Deactivate first: if the stream's own deactivate never landed (or
+        # activation failed before capture ever ran), this is the last point
+        # at which we still know the stream ID.
+        await self._deactivate_current("incoming URL removed")
         await self.server.delete_incoming(self.streamer.key, url)
         self._schedules.pop(url, None)
 
@@ -185,8 +224,7 @@ class ChannelWatcher:
                 pipeline_task.cancel()
                 raise
 
-        await self.server.deactivate(self.streamer.key, info.stream_id)
-        self.state.set_live(False)
+        await self._deactivate(info.stream_id)
         logger.info(
             "[%s] stream %s finished with %d lines",
             self.streamer.key,
@@ -241,9 +279,7 @@ class ChannelWatcher:
           stream the operator just stopped.
         """
         logger.info("[%s] restart signal handled; re-probing everything", self.streamer.key)
-        if self.state.stream_id and self.state.is_live:
-            await self.server.deactivate(self.streamer.key, self.state.stream_id)
-            self.state.set_live(False)
+        await self._deactivate_current("restart signal")
         # Belt-and-braces ack: the events listener already tried; the signal
         # is level-triggered until a DELETE lands (404 = already cleared).
         await self.server.ack_restart(self.streamer.key)
@@ -292,9 +328,7 @@ class ChannelWatcher:
 
                 await self._sleep_tick()
         finally:
-            if self.state.stream_id and self.state.is_live:
-                await self.server.deactivate(self.streamer.key, self.state.stream_id)
-                self.state.set_live(False)
+            await self._deactivate_current("watcher stopping")
         logger.info("[%s] watcher stopped", self.streamer.key)
 
     async def _check_url(self, url: str) -> None:
