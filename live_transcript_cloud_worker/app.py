@@ -8,7 +8,7 @@ import logging
 import random
 import signal
 
-from . import __version__
+from . import app_version, build_time
 from .config import Config, check_executables
 from .events import EventsListener
 from .heartbeat import heartbeat_loop
@@ -48,8 +48,9 @@ async def run_app(config: Config) -> int:
     prober = Prober(config)
 
     logger.info(
-        "live-transcript-cloud-worker %s starting: %d channel(s), provider=%s%s, server=%s",
-        __version__,
+        "live-transcript-cloud-worker %s (build %s) starting: %d channel(s), provider=%s%s, server=%s",
+        app_version(),
+        build_time(),
         len(streamers),
         config.transcription.provider,
         f"+{config.transcription.fallback_provider}" if config.transcription.fallback_provider else "",

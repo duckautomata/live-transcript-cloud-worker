@@ -7,7 +7,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-import os
+
+from . import app_version, build_time
 
 logger = logging.getLogger(__name__)
 
@@ -15,9 +16,9 @@ INTERVAL_SECONDS = 60.0
 
 
 async def heartbeat_loop(server, keys: list[str], stop_event: asyncio.Event) -> None:
-    version = os.environ.get("APP_VERSION", "local")
-    build_time = os.environ.get("BUILD_DATE", "unknown")
+    version = app_version()
+    built = build_time()
     while not stop_event.is_set():
-        await server.post_status(version, build_time, keys)
+        await server.post_status(version, built, keys)
         with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop_event.wait(), timeout=INTERVAL_SECONDS)
