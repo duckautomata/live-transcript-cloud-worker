@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import audio
-from .capture import AUDIO_FORMAT, VIDEO_FORMAT, ShouldStop, _terminate
+from .capture import AUDIO_FORMAT, DASH_VIDEO_FORMAT, FORMAT_SORT, ShouldStop, _terminate
 from .config import Config, StreamerConfig
 from .models import Chunk, MediaType, StreamInfo
 from .state import ChannelState, atomic_write
@@ -149,7 +149,9 @@ def _ytdlp_cmd(config: Config, streamer: StreamerConfig, url: str, fragment_dir:
         "--hls-prefer-native",
         "--hls-use-mpegts",
         "-f",
-        VIDEO_FORMAT if video else AUDIO_FORMAT,
+        DASH_VIDEO_FORMAT if video else AUDIO_FORMAT,
+        "-S",
+        FORMAT_SORT,
         "-o",
         f"{fragment_dir}/%(id)s.%(format_id)s",
         url,

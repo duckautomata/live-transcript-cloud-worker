@@ -35,8 +35,10 @@ from .ytdlp import auth_args
 
 logger = logging.getLogger(__name__)
 
-VIDEO_FORMAT = "bestvideo[vcodec^=avc]+bestaudio[acodec^=mp4a]/best[vcodec^=avc]/best"
-AUDIO_FORMAT = "bestaudio[acodec^=mp4a]/ba/best"
+VIDEO_FORMAT = "b/bv+ba"  # stdout pipeline (live edge)
+DASH_VIDEO_FORMAT = "bv*+ba/b"  # fragments written to files (--live-from-start)
+AUDIO_FORMAT = "ba/b"
+FORMAT_SORT = "vcodec:h264,proto:m3u8,acodec:aac"
 
 POLL_INTERVAL = 0.5
 TERMINATE_GRACE = 5.0
@@ -59,6 +61,8 @@ def _ytdlp_cmd(config: Config, streamer: StreamerConfig, url: str) -> list[str]:
         *auth_args(config, url, "download"),
         "-f",
         fmt,
+        "-S",
+        FORMAT_SORT,
         "-o",
         "-",
         url,
