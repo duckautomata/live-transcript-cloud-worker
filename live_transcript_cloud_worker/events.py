@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 
 from .config import Config
 from .watcher import ChannelWatcher
@@ -37,6 +38,10 @@ class EventsListener:
         self.watchers = watchers
         self.stop_event = stop_event
         self._cursor = 0
+        # Outage bookkeeping: the per-request warnings say a call failed, but
+        # nothing today says how long the server was actually gone. One line
+        # on the way down and one on the way back up gives that directly.
+        self._unreachable_since = 0.0
 
     async def run(self) -> None:
         keys = list(self.watchers)
@@ -55,6 +60,7 @@ class EventsListener:
                 if result is None:
                     await self._degraded_round(keys)
                     continue
+                self._note_reachable()
                 events, self._cursor = result
                 for key, kinds in events.items():
                     watcher = self.watchers.get(key)
@@ -84,7 +90,18 @@ class EventsListener:
         watcher.restart_event.set()
         await self.server.ack_restart(watcher.streamer.key)
 
+    def _note_unreachable(self) -> None:
+        if not self._unreachable_since:
+            self._unreachable_since = time.monotonic()
+            logger.warning("server unreachable; degrading to interval polling")
+
+    def _note_reachable(self) -> None:
+        if self._unreachable_since:
+            logger.info("server reachable again after %.1fs", time.monotonic() - self._unreachable_since)
+            self._unreachable_since = 0.0
+
     async def _degraded_round(self, keys: list[str]) -> None:
+        self._note_unreachable()
         for key in keys:
             watcher = self.watchers[key]
             if not watcher.restart_event.is_set() and await self.server.get_restart(key):

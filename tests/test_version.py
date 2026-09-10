@@ -32,7 +32,7 @@ async def test_heartbeat_reports_the_same_version(monkeypatch):
     posted = []
 
     class StubServer:
-        async def post_status(self, version, build, keys):
+        async def post_status(self, version, build, keys, cookie_state=None, cookie_reason=""):
             posted.append((version, build, tuple(keys)))
             stop.set()
 

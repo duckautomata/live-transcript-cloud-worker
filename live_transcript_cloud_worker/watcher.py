@@ -31,6 +31,12 @@ TICK_SECONDS = 1.0
 POST_CAPTURE_RECHECK_SECONDS = 5.0
 PIPELINE_DRAIN_SHUTDOWN_SECONDS = 45.0
 
+# A failed /incoming refresh is retried on this backoff rather than waiting out
+# the full fallback interval (600 s in the deployed config), which would leave
+# the channel un-probed for ten minutes after a few-second server restart.
+INCOMING_RETRY_BASE_SECONDS = 5.0
+INCOMING_RETRY_CAP_SECONDS = 120.0
+
 
 class _UrlSchedule:
     __slots__ = ("next_check", "offline_count")
@@ -65,6 +71,7 @@ class ChannelWatcher:
         self._schedules: dict[str, _UrlSchedule] = {}
         self._incoming_mode = config.server.incoming_polling.enabled
         self._last_incoming_refresh = 0.0
+        self._incoming_failures = 0
         # A stream whose deactivate never landed: the server still shows the
         # channel live, so the next chance (URL removal, restart, shutdown)
         # retries it.
@@ -81,6 +88,20 @@ class ChannelWatcher:
     def _jittered_interval(self) -> float:
         return self.config.server.channel_polling.interval_seconds + random.uniform(-5, 10)
 
+    def _cookies_degraded_for(self, url: str) -> bool:
+        """True when this URL's offline verdict cannot be trusted.
+
+        Twitch never gets cookies, so its verdicts stay authoritative no matter
+        what the YouTube jar is doing.
+        """
+        if platform_of(url) is Platform.TWITCH:
+            return False
+        # Read through the prober so watchers and probes can never disagree
+        # about the one worker-global jar. A watcher built without a prober
+        # (scheduling tests) has no cookie state and is treated as healthy.
+        cookies = getattr(self.prober, "cookies", None)
+        return cookies is not None and cookies.degraded
+
     def _schedule_after_probe(self, schedule: _UrlSchedule, outcome, url: str) -> None:
         polling = self.config.server.channel_polling
         now = time.time()
@@ -92,6 +113,20 @@ class ChannelWatcher:
                 min(wake, now + polling.max_interval_seconds),
             )
         elif outcome.result is ProbeResult.OFFLINE and outcome.confirmed_offline:
+            if self._cookies_degraded_for(url):
+                # Signed out, a /channel/<id>/live URL whose stream we cannot
+                # see raises yt-dlp's UserNotLive -- the very "not currently
+                # live" text classify_probe_failure keys on. Counting that
+                # would let a dead cookie drain the incoming queue via
+                # _drop_incoming_url. Freeze the counter rather than resetting
+                # it, so a genuine offline streak resumes where it left off.
+                logger.warning(
+                    "[%s] not counting confirmed-offline for %s while youtube cookies are degraded",
+                    self.streamer.key,
+                    url,
+                )
+                schedule.next_check = now + self._jittered_interval()
+                return
             schedule.offline_count += 1
             if not self._incoming_mode and platform_of(url) is not Platform.TWITCH:
                 schedule.next_check = now + polling.max_interval_seconds
@@ -131,8 +166,15 @@ class ChannelWatcher:
     # ------------------------------------------------------------- incoming
 
     async def _refresh_incoming(self) -> None:
-        self._last_incoming_refresh = time.time()
         urls = await self.server.get_incoming(self.streamer.key)
+        if urls is None:
+            # The server did not answer. An unanswered poll says nothing about
+            # the queue, so keep what we have: treating it as an empty queue
+            # would drop every URL and stop probing the channel entirely.
+            self._defer_incoming_retry()
+            return
+        self._incoming_failures = 0
+        self._last_incoming_refresh = time.time()
         known = set(self._schedules)
         current = set(urls)
         for url in current - known:
@@ -148,10 +190,34 @@ class ChannelWatcher:
             # live (docs/02). Usually already deactivated -> no request.
             await self._deactivate_current("incoming URL removed server-side")
 
-    def _incoming_fallback_elapsed(self) -> bool:
+    def _incoming_interval(self) -> float:
         events = self.config.server.events_polling
-        interval = events.fallback_interval_seconds if events.enabled else self.config.server.incoming_polling.interval_seconds
-        return time.time() - self._last_incoming_refresh >= interval
+        if events.enabled:
+            return events.fallback_interval_seconds
+        return self.config.server.incoming_polling.interval_seconds
+
+    def _incoming_fallback_elapsed(self) -> bool:
+        return time.time() - self._last_incoming_refresh >= self._incoming_interval()
+
+    def _defer_incoming_retry(self) -> None:
+        """Re-arm the fallback timer to fire again after a short backoff.
+
+        The timestamp is moved rather than left alone: an untouched
+        ``_last_incoming_refresh`` keeps ``_incoming_fallback_elapsed`` true,
+        and the run loop would re-poll on every 1 s tick for the whole outage.
+        """
+        self._incoming_failures += 1
+        delay = min(
+            INCOMING_RETRY_CAP_SECONDS,
+            INCOMING_RETRY_BASE_SECONDS * 2 ** (self._incoming_failures - 1),
+        )
+        self._last_incoming_refresh = time.time() - self._incoming_interval() + delay
+        logger.warning(
+            "[%s] incoming refresh failed; keeping %d known URL(s), retrying in %.0fs",
+            self.streamer.key,
+            len(self._schedules),
+            delay,
+        )
 
     async def _drop_incoming_url(self, url: str) -> None:
         logger.info("[%s] removing offline URL from incoming queue: %s", self.streamer.key, url)
@@ -284,8 +350,17 @@ class ChannelWatcher:
         # is level-triggered until a DELETE lands (404 = already cleared).
         await self.server.ack_restart(self.streamer.key)
         if self._incoming_mode:
-            self._schedules.clear()
-            await self._refresh_incoming()
+            # Fetch before clearing. Clearing first and then failing to reach
+            # the server would leave the channel with no URLs at all -- an
+            # admin-stop that lands during a redeploy would silently disable
+            # the channel rather than restarting it.
+            urls = await self.server.get_incoming(self.streamer.key)
+            if urls is None:
+                self._defer_incoming_retry()
+            else:
+                self._incoming_failures = 0
+                self._last_incoming_refresh = time.time()
+                self._schedules = {url: _UrlSchedule() for url in urls}
         else:
             # Static URLs come from config; re-probe them all immediately.
             for schedule in self._schedules.values():
@@ -369,6 +444,9 @@ class ChannelWatcher:
         if (
             self._incoming_mode
             and outcome.confirmed_offline
+            # Deleting the operator's queued URL is irreversible from here, so
+            # it never happens on a verdict a dead cookie could have produced.
+            and not self._cookies_degraded_for(url)
             and schedule.offline_count >= self.config.server.incoming_polling.offline_delete_threshold
         ):
             await self._drop_incoming_url(url)

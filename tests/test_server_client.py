@@ -187,3 +187,94 @@ async def test_429_respects_retry_after(tmp_path, monkeypatch):
     client, script = client_with(tmp_path, (429, "slow down"), (200, "ok"))
     assert await client.activate("chan", "abc", "T", 1000, MediaType.NONE)
     assert len(script.requests) == 2
+
+
+# ----------------------------- transport failure vs an authoritative answer
+
+
+async def test_get_incoming_returns_none_when_unreachable(tmp_path):
+    # None, not []: the watcher drops every URL it knows about when the queue
+    # reads empty, so a transport failure must stay distinguishable from one.
+    client, script = client_with(
+        tmp_path,
+        httpx.ConnectError("All connection attempts failed"),
+        httpx.ConnectError("All connection attempts failed"),
+    )
+    assert await client.get_incoming("chan") is None
+    assert len(script.requests) == 2
+
+
+async def test_get_incoming_returns_empty_list_when_server_says_empty(tmp_path):
+    client, _ = client_with(tmp_path, (200, {"urls": []}))
+    assert await client.get_incoming("chan") == []
+
+
+async def test_get_incoming_unparseable_body_is_not_an_empty_queue(tmp_path):
+    client, _ = client_with(tmp_path, (200, "not json"))
+    assert await client.get_incoming("chan") is None
+
+
+async def test_get_restart_retries_once(tmp_path):
+    # get_restart only ever runs after /events already failed, so a single
+    # attempt is guaranteed to be the worst-timed one.
+    client, script = client_with(
+        tmp_path,
+        httpx.ConnectError("refused"),
+        (200, {"pending": True}),
+    )
+    assert await client.get_restart("chan") is True
+    assert len(script.requests) == 2
+
+
+async def test_no_backoff_sleep_after_the_final_attempt(tmp_path, monkeypatch):
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(sc.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(sc, "_backoff", lambda *a, **k: 1.0)
+
+    client, script = client_with(
+        tmp_path,
+        httpx.ConnectError("refused"),
+        httpx.ConnectError("refused"),
+    )
+    assert await client.get_incoming("chan") is None
+    # Two attempts, one gap between them: the trailing sleep bought nothing
+    # and only widened every observed outage.
+    assert len(script.requests) == 2
+    assert slept == [1.0]
+
+
+async def test_final_retry_after_is_still_honoured(tmp_path, monkeypatch):
+    # Skipping the last sleep must not drop server-requested backpressure.
+    slept: list[float] = []
+
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+
+    monkeypatch.setattr(sc.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(sc, "_backoff", lambda attempt, retry_after=None: 9.0 if retry_after else 1.0)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(429, headers={"Retry-After": "9"}, text="slow down")
+
+    config = make_config(tmp_path)
+    client = ServerClient(config, transport=httpx.MockTransport(handler))
+
+    assert await client.get_incoming("chan") is None
+    assert slept == [9.0, 9.0]
+
+
+def test_error_chain_surfaces_the_underlying_errno():
+    # "All connection attempts failed" names no errno; the errno is the whole
+    # diagnosis, and it only survives on the cause chain.
+    cause = ConnectionRefusedError(111, "Connection refused")
+    exc = httpx.ConnectError("All connection attempts failed")
+    exc.__cause__ = OSError("All connection attempts failed")
+    exc.__cause__.__cause__ = cause
+
+    chain = sc._error_chain(exc)
+    assert "ConnectionRefusedError" in chain
+    assert "111" in chain

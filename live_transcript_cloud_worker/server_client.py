@@ -53,6 +53,31 @@ class MediaResult(Enum):
     RETRY_LATER = "retry_later"
 
 
+def _error_chain(exc: BaseException, limit: int = 4) -> str:
+    """Render an exception with its __cause__/__context__ chain.
+
+    httpx reports a failed connect as ConnectError("All connection attempts
+    failed") -- anyio's wording, which names no errno. The errno is the whole
+    diagnosis (ECONNREFUSED = nothing listening, so the server is restarting;
+    EHOSTUNREACH/ENETUNREACH = the bridge or netfilter; EMFILE = we ran out of
+    descriptors and the server was never at fault), and it survives only on
+    the cause chain, so unwrap it.
+    """
+    parts: list[str] = []
+    seen: set[int] = set()
+    cur: BaseException | None = exc
+    while cur is not None and id(cur) not in seen and len(parts) < limit:
+        seen.add(id(cur))
+        if isinstance(cur, BaseExceptionGroup):
+            # anyio clears the list backing args[1] in a finally block, so the
+            # repr is empty by the time we see it; .exceptions still holds.
+            parts.append(f"{type(cur).__name__}({cur.args[0]!r}, {list(cur.exceptions)!r})")
+        else:
+            parts.append(repr(cur))
+        cur = cur.__cause__ or cur.__context__
+    return " <- ".join(parts)
+
+
 def _backoff(attempt: int, retry_after: str | None = None) -> float:
     if retry_after:
         try:
@@ -96,12 +121,20 @@ class ServerClient:
         permanently failed / exhausted its retries.
         """
         last_error: str = ""
+        started = time.monotonic()
         for attempt in range(attempts):
+            is_last = attempt + 1 >= attempts
             try:
                 response = await self._client.request(method, path, **kwargs)
             except httpx.HTTPError as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                await asyncio.sleep(_backoff(attempt))
+                # Keep the __cause__ chain: anyio's "All connection attempts
+                # failed" hides the errno that says *why*, and that errno is
+                # the difference between "the server is restarting"
+                # (ECONNREFUSED), "the bridge is gone" (EHOSTUNREACH) and
+                # "we ran out of file descriptors" (EMFILE).
+                last_error = _error_chain(exc)
+                if not is_last:
+                    await asyncio.sleep(_backoff(attempt))
                 continue
 
             status = response.status_code
@@ -112,13 +145,25 @@ class ServerClient:
                 return None
             if status == 429 or status >= 500 or (status == 404 and retry_404):
                 last_error = f"HTTP {status}"
-                await asyncio.sleep(_backoff(attempt, response.headers.get("Retry-After")))
+                retry_after = response.headers.get("Retry-After")
+                # The final sleep is skipped only when the server did not ask
+                # for one: honouring Retry-After is the sole backpressure the
+                # caller has (post_line's caller resubmits immediately).
+                if not is_last or retry_after:
+                    await asyncio.sleep(_backoff(attempt, retry_after))
                 continue
             body = response.text[:200]
             logger.error("%s %s -> HTTP %s (%s); not retrying", method, path, status, body)
             return None
 
-        logger.warning("%s %s failed after %d attempts (%s)", method, path, attempts, last_error)
+        logger.warning(
+            "%s %s gave up after %d attempt(s) in %.1fs (%s)",
+            method,
+            path,
+            attempts,
+            time.monotonic() - started,
+            last_error,
+        )
         return None
 
     # ------------------------------------------------------------ lifecycle
@@ -223,6 +268,7 @@ class ServerClient:
         """One long-poll round. Returns (events, cursor) or None on failure,
         the caller degrades to interval polling for that round (docs/01)."""
         timeout = httpx.Timeout(connect=5.0, read=wait + 10.0, write=10.0, pool=5.0)
+        started = time.monotonic()
         try:
             response = await self._longpoll.get(
                 "/events",
@@ -230,7 +276,7 @@ class ServerClient:
                 timeout=timeout,
             )
         except httpx.HTTPError as exc:
-            logger.debug("/events failed: %s", exc)
+            logger.debug("/events failed after %.1fs: %s", time.monotonic() - started, _error_chain(exc))
             return None
         if response.status_code == 204:
             return {}, since
@@ -247,14 +293,24 @@ class ServerClient:
             logger.debug("/events -> HTTP %s", response.status_code)
         return None
 
-    async def get_incoming(self, channel: str) -> list[str]:
+    async def get_incoming(self, channel: str) -> list[str] | None:
+        """The queue's URLs, or None when the server did not answer.
+
+        None and [] must stay distinguishable: the watcher treats [] as "the
+        operator emptied the queue" and drops every URL it knows about, so
+        collapsing a transport failure onto [] blinds the channel until the
+        next fallback refresh.
+        """
         response = await self._request("GET", f"/{channel}/incoming", attempts=2)
         if response is None:
-            return []
+            return None
         try:
             return list(response.json().get("urls") or [])
         except (ValueError, TypeError):
-            return []
+            # The server answered, it just answered badly; that is not a
+            # reason to believe the queue is empty either.
+            logger.error("[%s] /incoming returned an unparseable body", channel)
+            return None
 
     async def delete_incoming(self, channel: str, url: str) -> bool:
         response = await self._request(
@@ -268,7 +324,12 @@ class ServerClient:
         return response is not None  # 404 = already gone = success
 
     async def get_restart(self, channel: str) -> bool:
-        response = await self._request("GET", f"/{channel}/restart", attempts=1)
+        # Two attempts, not one: this is only ever called after /events has
+        # already failed, i.e. at the moment the server is known to be down,
+        # so a single shot is guaranteed to be the worst-timed one. The flag
+        # is level-triggered server-side and the GET is idempotent, so the
+        # extra attempt is free of side effects.
+        response = await self._request("GET", f"/{channel}/restart", attempts=2)
         if response is None:
             return False
         try:
@@ -286,8 +347,22 @@ class ServerClient:
         )
         return response is not None  # 404 = nothing pending = success
 
-    async def post_status(self, version: str, build_time: str, keys: list[str]) -> None:
-        body = {"version": version, "build_time": build_time, "keys": keys}
+    async def post_status(
+        self,
+        version: str,
+        build_time: str,
+        keys: list[str],
+        cookie_state: str | None = None,
+        cookie_reason: str = "",
+    ) -> None:
+        body: dict[str, Any] = {"version": version, "build_time": build_time, "keys": keys}
+        # Added fields, never required ones: worker and server deploy
+        # independently, so an old server must keep accepting this body (it
+        # ignores unknown JSON fields) and a new server must tolerate its
+        # absence from an old worker.
+        if cookie_state:
+            body["cookie_state"] = cookie_state
+            body["cookie_reason"] = cookie_reason
         try:
             response = await self._client.post("/status", json=body)
             if response.status_code != 200:
@@ -360,7 +435,14 @@ class LocalClient:
     async def ack_restart(self, channel: str) -> bool:
         return True
 
-    async def post_status(self, version: str, build_time: str, keys: list[str]) -> None:
+    async def post_status(
+        self,
+        version: str,
+        build_time: str,
+        keys: list[str],
+        cookie_state: str | None = None,
+        cookie_reason: str = "",
+    ) -> None:
         pass
 
     async def server_version(self) -> dict[str, str] | None:

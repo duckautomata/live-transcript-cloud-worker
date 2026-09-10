@@ -10,6 +10,7 @@ import signal
 
 from . import app_version, build_time
 from .config import Config, check_executables
+from .cookieauth import CookieAuthTracker
 from .events import EventsListener
 from .heartbeat import heartbeat_loop
 from .server_client import LocalClient, ServerClient
@@ -45,7 +46,8 @@ async def run_app(config: Config) -> int:
     server = ServerClient(config) if config.server.enabled else LocalClient(config)
     transcriber = TranscriptionService(config.transcription)
     uploader = MediaUploader(config, server)
-    prober = Prober(config)
+    cookies = CookieAuthTracker()
+    prober = Prober(config, cookies)
 
     logger.info(
         "live-transcript-cloud-worker %s (build %s) starting: %d channel(s), provider=%s%s, server=%s",
@@ -69,7 +71,7 @@ async def run_app(config: Config) -> int:
     watchers = {s.key: ChannelWatcher(config, s, states[s.key], server, prober, transcriber, uploader, stop_event) for s in streamers}
 
     background: list[asyncio.Task] = [
-        asyncio.create_task(heartbeat_loop(server, list(watchers), stop_event), name="heartbeat"),
+        asyncio.create_task(heartbeat_loop(server, list(watchers), stop_event, cookies), name="heartbeat"),
     ]
     if config.server.enabled:
         listener = EventsListener(config, server, watchers, stop_event)

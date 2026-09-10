@@ -9,7 +9,11 @@ from conftest import make_config
 
 from live_transcript_cloud_worker.models import Platform, ProbeResult, StreamInfo
 from live_transcript_cloud_worker.state import ChannelState
-from live_transcript_cloud_worker.watcher import ChannelWatcher, _UrlSchedule
+from live_transcript_cloud_worker.watcher import (
+    INCOMING_RETRY_BASE_SECONDS,
+    ChannelWatcher,
+    _UrlSchedule,
+)
 from live_transcript_cloud_worker.ytdlp import (
     ProbeOutcome,
     _info_from_metadata,
@@ -328,3 +332,154 @@ async def test_restart_static_mode_keeps_config_urls_and_reprobes(tmp_path):
     assert watcher._schedules[url].next_check == 0.0  # re-probed immediately
     assert watcher._schedules[url].offline_count == 0
     assert not watcher.restart_event.is_set()
+
+
+# ------------------------------------------- transient /incoming failures
+
+
+class UnreachableIncomingServer(RestartStubServer):
+    """get_incoming returns None: the server never answered."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.incoming_calls = 0
+
+    async def get_incoming(self, key):
+        self.incoming_calls += 1
+        return None
+
+
+async def test_unanswered_incoming_poll_keeps_known_urls(tmp_path):
+    from live_transcript_cloud_worker.models import MediaType
+
+    # A few-second server restart must not look like "the operator emptied
+    # the queue": dropping the URLs here stops the channel being probed at
+    # all, and deactivates a stream that is still running.
+    server = UnreachableIncomingServer()
+    watcher = make_restart_watcher(tmp_path, incoming_mode=True, server=server)
+    watcher.state.start_new_stream("livestream", "T", 1000, MediaType.AUDIO)
+    url = "https://www.youtube.com/watch?v=livestream"
+    watcher._schedules[url] = _UrlSchedule()
+
+    await watcher._refresh_incoming()
+
+    assert list(watcher._schedules) == [url]
+    assert server.deactivated == []
+
+
+async def test_unanswered_incoming_poll_retries_before_the_fallback_window(tmp_path):
+    server = UnreachableIncomingServer()
+    watcher = make_restart_watcher(tmp_path, incoming_mode=True, server=server)
+
+    await watcher._refresh_incoming()
+
+    # The retry must land on the short backoff, not the (much longer)
+    # fallback interval, and must not be due instantly either -- that would
+    # re-poll on every 1 s tick for the whole outage.
+    assert not watcher._incoming_fallback_elapsed()
+    delay = watcher._last_incoming_refresh + watcher._incoming_interval() - time.time()
+    assert 0 < delay <= INCOMING_RETRY_BASE_SECONDS + 1
+
+
+async def test_repeated_incoming_failures_back_off_and_then_reset(tmp_path):
+    server = UnreachableIncomingServer()
+    watcher = make_restart_watcher(tmp_path, incoming_mode=True, server=server)
+
+    for _ in range(3):
+        await watcher._refresh_incoming()
+    assert watcher._incoming_failures == 3
+
+    # A successful poll clears the backoff and applies the queue normally.
+    watcher.server = RestartStubServer(incoming=["https://www.youtube.com/watch?v=fresh"])
+    await watcher._refresh_incoming()
+
+    assert watcher._incoming_failures == 0
+    assert list(watcher._schedules) == ["https://www.youtube.com/watch?v=fresh"]
+
+
+async def test_restart_during_outage_keeps_urls(tmp_path):
+    # An admin-stop that lands during a redeploy used to clear the URL set
+    # and then fail to refill it, silently disabling the channel.
+    server = UnreachableIncomingServer()
+    watcher = make_restart_watcher(tmp_path, incoming_mode=True, server=server)
+    url = "https://www.youtube.com/watch?v=queued"
+    watcher._schedules[url] = _UrlSchedule()
+    watcher.restart_event.set()
+
+    await watcher._handle_restart()
+
+    assert list(watcher._schedules) == [url]
+    assert not watcher.restart_event.is_set()
+
+
+# --------------------------------------- cookie outage must not drain the queue
+
+
+class _StubProber:
+    def __init__(self, cookies):
+        self.cookies = cookies
+
+
+async def test_degraded_cookies_freeze_the_offline_delete_counter(tmp_path):
+    from live_transcript_cloud_worker.cookieauth import CookieAuth, CookieAuthTracker
+
+    # Signed out, a /channel/<id>/live URL we cannot see raises yt-dlp's
+    # UserNotLive -- the same "not currently live" text a genuine offline
+    # produces. Counting it would delete the operator's queued URL.
+    server = RestartStubServer(incoming=[])
+    watcher = make_restart_watcher(tmp_path, incoming_mode=True, server=server)
+    tracker = CookieAuthTracker()
+    tracker.observe(CookieAuth.ROTATED)
+    watcher.prober = _StubProber(tracker)
+
+    url = "https://www.youtube.com/channel/UCabc/live"
+    schedule = _UrlSchedule()
+    watcher._schedules[url] = schedule
+    outcome = ProbeOutcome(ProbeResult.OFFLINE, StreamInfo(url=url), confirmed_offline=True)
+
+    for _ in range(20):
+        watcher._schedule_after_probe(schedule, outcome, url)
+
+    assert schedule.offline_count == 0
+    assert server.deleted == []
+
+
+async def test_healthy_cookies_still_count_offline_normally(tmp_path):
+    from live_transcript_cloud_worker.cookieauth import CookieAuth, CookieAuthTracker
+
+    server = RestartStubServer(incoming=[])
+    watcher = make_restart_watcher(tmp_path, incoming_mode=True, server=server)
+    tracker = CookieAuthTracker()
+    tracker.observe(CookieAuth.OK)
+    watcher.prober = _StubProber(tracker)
+
+    url = "https://www.youtube.com/channel/UCabc/live"
+    schedule = _UrlSchedule()
+    watcher._schedules[url] = schedule
+    outcome = ProbeOutcome(ProbeResult.OFFLINE, StreamInfo(url=url), confirmed_offline=True)
+
+    for _ in range(3):
+        watcher._schedule_after_probe(schedule, outcome, url)
+
+    assert schedule.offline_count == 3
+
+
+async def test_twitch_is_unaffected_by_dead_youtube_cookies(tmp_path):
+    from live_transcript_cloud_worker.cookieauth import CookieAuth, CookieAuthTracker
+
+    # Twitch never gets cookies, so its offline verdicts stay authoritative.
+    server = RestartStubServer(incoming=[])
+    watcher = make_restart_watcher(tmp_path, incoming_mode=True, server=server)
+    tracker = CookieAuthTracker()
+    tracker.observe(CookieAuth.ROTATED)
+    watcher.prober = _StubProber(tracker)
+
+    url = "https://www.twitch.tv/somechan"
+    schedule = _UrlSchedule()
+    watcher._schedules[url] = schedule
+    outcome = ProbeOutcome(ProbeResult.OFFLINE, StreamInfo(url=url), confirmed_offline=True)
+
+    for _ in range(3):
+        watcher._schedule_after_probe(schedule, outcome, url)
+
+    assert schedule.offline_count == 3

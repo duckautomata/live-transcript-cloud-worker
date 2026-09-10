@@ -14,10 +14,24 @@ import re
 import time
 
 from .config import Config
+from .cookieauth import CookieAuthTracker, classify_cookie_auth
 from .models import Platform, ProbeResult, StreamInfo, valid_stream_id
 from .state import ChannelState
 
 logger = logging.getLogger(__name__)
+
+# --verbose is what makes cookie health observable (see cookieauth), but it
+# prepends ~16 lines of banner to every probe's stderr. Those lines would
+# otherwise crowd out the real error in the 4 KB stream stats log and in the
+# probe failure log line, so they are stripped everywhere except the cookie
+# classifier, which is the one consumer that wants them.
+_DEBUG_LINE_RE = re.compile(r"^\[debug\] .*\n?", re.MULTILINE)
+
+
+def _terse(stderr: str) -> str:
+    """yt-dlp stderr with the --verbose banner removed."""
+    return _DEBUG_LINE_RE.sub("", stderr).strip()
+
 
 _BEGIN_IN_RE = re.compile(r"will begin in ([^.]+)")
 _DURATION_PART_RE = re.compile(r"(\d+)\s+(day|hour|minute|second)s?")
@@ -157,14 +171,21 @@ def _info_from_metadata(url: str, metadata: dict) -> StreamInfo:
 class Prober:
     """Bounded-concurrency yt-dlp -j liveness probing."""
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, cookies: CookieAuthTracker | None = None) -> None:
         self.config = config
+        self.cookies = cookies or CookieAuthTracker()
         self._semaphore = asyncio.Semaphore(config.capture.probe_concurrency)
 
     async def probe(self, url: str, state: ChannelState | None = None) -> ProbeOutcome:
         cmd = [
             self.config.capture.yt_dlp_path,
             "-j",
+            # --verbose buys the only cookie-health signal that is a level
+            # rather than a one-shot edge: the YouTube extractor's "Found
+            # YouTube account cookies", printed during init before the first
+            # request. It goes to stderr only, so the -j JSON on stdout is
+            # untouched.
+            "-v",
             *auth_args(self.config, url, "check"),
             url,
         ]
@@ -188,17 +209,36 @@ class Prober:
 
         stdout = stdout_b.decode("utf-8", errors="replace")
         stderr = stderr_b.decode("utf-8", errors="replace")
+
+        # Classify on every probe, successful or not. yt-dlp prints the cookie
+        # verdict during init and then carries on anonymously, so a probe that
+        # SUCCEEDS is just as much a report on the jar as one that fails --
+        # and discarding those was why a dead cookie could go unnoticed
+        # indefinitely.
+        jar = self.config.cookies_file("check")
+        self.cookies.observe(
+            classify_cookie_auth(
+                # Mirror auth_args exactly: a configured-but-missing file means
+                # --cookies was never passed, and yt-dlp cannot report on a jar
+                # it was not given.
+                cookies_enabled=jar is not None and jar.is_file(),
+                is_youtube=platform_of(url) is Platform.YOUTUBE,
+                stderr=stderr,
+            )
+        )
+
+        terse = _terse(stderr)
         if state is not None:
             state.stream_stats_log.append(
-                f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} probe {url} rc={proc.returncode}\n{stdout[:4096]}\n{stderr[:4096]}"
+                f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} probe {url} rc={proc.returncode}\n{stdout[:4096]}\n{terse[:4096]}"
             )
 
         if proc.returncode != 0:
-            scheduled, confirmed = classify_probe_failure(stderr, platform_of(url))
+            scheduled, confirmed = classify_probe_failure(terse, platform_of(url))
             if scheduled:
                 return ProbeOutcome(ProbeResult.UPCOMING, StreamInfo(url=url), scheduled_start=scheduled)
             if not confirmed:
-                logger.debug("probe %s exited %s: %s", url, proc.returncode, stderr[-500:])
+                logger.debug("probe %s exited %s: %s", url, proc.returncode, terse[-500:])
             return ProbeOutcome(ProbeResult.OFFLINE, StreamInfo(url=url), confirmed_offline=confirmed)
 
         try:
