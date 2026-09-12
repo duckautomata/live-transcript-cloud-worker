@@ -259,4 +259,11 @@ class Prober:
             return ProbeOutcome(ProbeResult.LIVE, info)
         if info.is_upcoming:
             return ProbeOutcome(ProbeResult.UPCOMING, info, scheduled_start=info.scheduled_start)
-        return ProbeOutcome(ProbeResult.OFFLINE, info)
+        # Resolved successfully but not live. A terminal live_status (an ended
+        # broadcast or a plain, never-live video) is as definitive as yt-dlp's
+        # UserNotLive failure, so it is reported as confirmed offline: without
+        # this an ended YouTube stream -- which reads as "was_live", never
+        # "not currently live" -- would be re-probed at the base cadence
+        # forever and, in incoming mode, never reach the offline-delete
+        # threshold. An empty/unknown status stays soft (unconfirmed).
+        return ProbeOutcome(ProbeResult.OFFLINE, info, confirmed_offline=info.is_terminal_offline)

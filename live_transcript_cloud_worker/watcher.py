@@ -425,10 +425,10 @@ class ChannelWatcher:
             captured = await self._run_stream(info)
             if captured and not self._should_stop() and self._incoming_mode:
                 # Capture ended on its own. If the stream is really over,
-                # remove its queued URL now (docs/02), ended YouTube streams
-                # read as "was_live", never "not currently live", so the
-                # offline-delete threshold would never fire for them. A
-                # capture that died mid-stream sees LIVE here and resumes.
+                # remove its queued URL now (docs/02) rather than waiting out
+                # the offline-delete threshold: this is the fast path for the
+                # common case. A capture that died mid-stream sees LIVE here
+                # and resumes.
                 verify = await self.prober.probe(url, self.state)
                 if verify.result is not ProbeResult.LIVE:
                     await self._drop_incoming_url(url)

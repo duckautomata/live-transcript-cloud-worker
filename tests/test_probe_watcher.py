@@ -7,6 +7,7 @@ import time
 
 from conftest import make_config
 
+from live_transcript_cloud_worker.config import CaptureConfig
 from live_transcript_cloud_worker.models import Platform, ProbeResult, StreamInfo
 from live_transcript_cloud_worker.state import ChannelState
 from live_transcript_cloud_worker.watcher import (
@@ -16,6 +17,7 @@ from live_transcript_cloud_worker.watcher import (
 )
 from live_transcript_cloud_worker.ytdlp import (
     ProbeOutcome,
+    Prober,
     _info_from_metadata,
     classify_probe_failure,
     platform_of,
@@ -85,6 +87,51 @@ def test_strip_trailing_timestamp_keeps_the_broadcaster_s_own_text():
     assert strip_trailing_timestamp("Best of (Part 1) 12:00") == "Best of (Part 1)"
     # A title that is nothing but a stamp is kept: empty is worse than noisy.
     assert strip_trailing_timestamp("2026-08-12 17:38") == "2026-08-12 17:38"
+
+
+def test_terminal_status_is_confirmed_offline():
+    # A finished YouTube stream resolves successfully (rc=0, is_live=false) and
+    # reads as "was_live", never yt-dlp's "not currently live" failure. It must
+    # still classify as confirmed offline, or an ended stream is re-probed at
+    # the base cadence forever and never leaves the incoming queue.
+    for status in ("was_live", "post_live", "not_live"):
+        info = _info_from_metadata(
+            "https://www.youtube.com/watch?v=abc",
+            {"id": "abc", "is_live": False, "live_status": status, "title": "t"},
+        )
+        assert info.is_terminal_offline, status
+
+
+def test_live_and_unknown_are_not_terminal_offline():
+    live = _info_from_metadata(
+        "https://www.youtube.com/watch?v=abc",
+        {"id": "abc", "is_live": True, "live_status": "is_live", "title": "t"},
+    )
+    assert not live.is_terminal_offline
+    # An empty/unknown status is transient (yt-dlp emits it between states):
+    # acting on it could drop a URL that is about to go live.
+    unknown = _info_from_metadata(
+        "https://www.youtube.com/watch?v=abc",
+        {"id": "abc", "is_live": False, "title": "t"},
+    )
+    assert unknown.live_status == "unknown"
+    assert not unknown.is_terminal_offline
+
+
+async def test_probe_reports_ended_stream_as_confirmed_offline(tmp_path):
+    # End to end through the real Prober subprocess: a finished stream is a
+    # *successful* probe (rc=0) whose metadata says was_live. It must come back
+    # confirmed offline so the watcher backs it off and drops it from the queue
+    # instead of re-probing every minute forever.
+    fake = tmp_path / "fake-yt-dlp"
+    fake.write_text('#!/bin/bash\necho \'{"id": "abc", "live_status": "was_live", "title": "t"}\'\n')
+    fake.chmod(0o755)
+    config = make_config(tmp_path, capture=CaptureConfig(yt_dlp_path=str(fake)))
+
+    outcome = await Prober(config).probe("https://www.youtube.com/watch?v=abc")
+
+    assert outcome.result is ProbeResult.OFFLINE
+    assert outcome.confirmed_offline
 
 
 def test_probe_title_has_no_timestamp():

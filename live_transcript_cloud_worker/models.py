@@ -73,6 +73,12 @@ class Line:
         )
 
 
+# live_status values that mean "resolved, but definitively not a live stream
+# right now" -- an ended broadcast or a plain video. Kept in sync with the
+# StreamInfo.live_status comment.
+_TERMINAL_OFFLINE_STATUSES = frozenset({"was_live", "post_live", "not_live"})
+
+
 @dataclass(frozen=True)
 class StreamInfo:
     """Result of probing a URL with yt-dlp."""
@@ -81,13 +87,26 @@ class StreamInfo:
     stream_id: str = ""
     title: str = ""
     is_live: bool = False
-    live_status: str = "unknown"  # is_live | is_upcoming | was_live | not_live | unknown
+    live_status: str = "unknown"  # is_live | is_upcoming | was_live | post_live | not_live | unknown
     scheduled_start: int | None = None  # unix seconds, when live_status == is_upcoming
     start_time: int | None = None  # actual stream start (release_timestamp/timestamp)
 
     @property
     def is_upcoming(self) -> bool:
         return self.live_status == "is_upcoming"
+
+    @property
+    def is_terminal_offline(self) -> bool:
+        """A definitive not-live verdict from a *successful* probe: the stream
+        has ended (``was_live``/``post_live``) or the video was never a
+        broadcast (``not_live``). As conclusive as yt-dlp's UserNotLive
+        failure, so the watcher treats it as confirmed offline -- it backs off
+        and, in incoming mode, advances the offline-delete threshold. An empty
+        or ``unknown`` status is deliberately excluded: yt-dlp emits it while a
+        stream is briefly between states, and acting on it could drop a URL
+        that is about to go (or come back) live.
+        """
+        return self.live_status in _TERMINAL_OFFLINE_STATUSES
 
 
 @dataclass(frozen=True)
