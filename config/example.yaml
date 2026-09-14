@@ -32,9 +32,36 @@ server:
   incoming_polling:
     # true = ignore streamers[].urls; take URLs from GET /{key}/incoming.
     enabled: false
+    # Queue poll cadence when events polling is off. With events polling on
+    # it is the maximum age of the worker's copy of the queue before a probe:
+    # the events signal only announces ADDED URLs, so this bounds how long a
+    # URL you removed by hand keeps being probed.
     interval_seconds: 30
-    # Consecutive "confirmed offline" probes before a queued URL is removed.
+    # Consecutive "confirmed offline" probes (yt-dlp's "not currently live",
+    # or a resolved was_live/post_live/not_live status, seen while the
+    # YouTube cookies authenticate) before a queued URL is removed.
     offline_delete_threshold: 2
+    # Consecutive probes that could not tell whether the stream is live (an
+    # unrecognised yt-dlp error such as a private/removed video or a bot
+    # check, an unknown live_status, a members-only entry the match filter
+    # rejected, or any offline verdict while the YouTube cookies are dead,
+    # including yt-dlp's own "not currently live" which a signed-out probe
+    # cannot be trusted on) before the worker gives up and removes the queued
+    # URL. Probe timeouts, yt-dlp network/rate-limit/extractor failures and
+    # other worker-side errors never count. At the base cadence this is
+    # about N x channel_polling.interval_seconds; while cookies are dead the
+    # URL is probed every cookies.degraded_probe_interval_seconds instead, so
+    # the same count spans at least N x that, and a re-minted cookies.txt
+    # (detected by file change) resumes capture long before it fires. The
+    # stream may still be live when this fires; re-queue it once the cause is
+    # fixed. 0 = never give up: the URL stays until removed by hand or by the
+    # server's queue TTL (streamTtlMinutes, 24 h by default).
+    inconclusive_delete_threshold: 10
+    # The streak must also have lasted at least this long before the worker
+    # gives up, so a short worker-wide hiccup (a datacenter bot check with a
+    # healthy jar, an outage the worker did not recognise as its own) cannot
+    # drain every channel's queue in ten minutes. 0 = count only.
+    inconclusive_min_span_seconds: 3600
 
   events_polling:
     enabled: true
@@ -62,6 +89,18 @@ server:
     # rotated/scoped independently. May point at the same file.
     check_filename: cookies.txt
     download_filename: cookies.txt
+    # While yt-dlp reports the jar is not authenticating, YouTube URLs are
+    # probed at this slower cadence instead of channel_polling.interval_seconds:
+    # every probe with a dead jar is a wasted run that also rewrites
+    # cookies.txt. Overwriting cookies.txt in place (cp / cat > / scp onto the
+    # existing path) re-probes them immediately; a rename-style replacement
+    # (mv, rsync without --inplace, an editor's atomic save) is invisible
+    # through a single-file Docker bind mount and needs a container restart.
+    # yt-dlp writes its in-memory jar back on exit, so a capture that is
+    # running when you overwrite the file puts the OLD cookies back when it
+    # ends: give check_filename and download_filename different files, or
+    # copy the jar again once the capture is over.
+    degraded_probe_interval_seconds: 600
 
   stale_threshold:
     # DASH only: wait this long for a fragment sequence's tracks to complete

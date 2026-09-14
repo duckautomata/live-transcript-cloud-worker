@@ -33,8 +33,17 @@ class ConfigError(Exception):
 @dataclass(frozen=True)
 class IncomingPollingConfig:
     enabled: bool = False
+    # Queue poll cadence without events polling; with it, the maximum age of
+    # the worker's copy of the queue before a probe is spent on a URL.
     interval_seconds: float = 30.0
+    # Consecutive trusted confirmed-offline probes before a queued URL is removed.
     offline_delete_threshold: int = 2
+    # Consecutive probes that could not tell whether the stream is live
+    # before the worker gives up on a queued URL. 0 = never.
+    inconclusive_delete_threshold: int = 10
+    # ...and the streak must also have lasted at least this long, so a short
+    # worker-wide hiccup cannot drain every channel's queue. 0 = count only.
+    inconclusive_min_span_seconds: float = 3600.0
 
 
 @dataclass(frozen=True)
@@ -56,6 +65,8 @@ class CookiesConfig:
     enabled: bool = False
     check_filename: str = "cookies.txt"
     download_filename: str = "cookies.txt"
+    # Probe cadence for YouTube URLs while yt-dlp reports the jar is dead.
+    degraded_probe_interval_seconds: float = 600.0
 
 
 @dataclass(frozen=True)
@@ -326,6 +337,16 @@ def _validate(config: Config) -> None:
         problems.append("server.buffer_size_seconds must be > 0")
     if not (0 <= server.events_polling.wait_seconds <= 60):
         problems.append("server.events_polling.wait_seconds must be within [0, 60]")
+    if server.incoming_polling.interval_seconds <= 0:
+        problems.append("server.incoming_polling.interval_seconds must be > 0")
+    if server.incoming_polling.offline_delete_threshold < 1:
+        problems.append("server.incoming_polling.offline_delete_threshold must be >= 1")
+    if server.incoming_polling.inconclusive_delete_threshold < 0:
+        problems.append("server.incoming_polling.inconclusive_delete_threshold must be >= 0 (0 disables it)")
+    if server.incoming_polling.inconclusive_min_span_seconds < 0:
+        problems.append("server.incoming_polling.inconclusive_min_span_seconds must be >= 0 (0 = count only)")
+    if server.cookies.degraded_probe_interval_seconds <= 0:
+        problems.append("server.cookies.degraded_probe_interval_seconds must be > 0")
     if server.use_dash_for_youtube and server.cookies.enabled:
         problems.append(
             "use_dash_for_youtube must be turned off when cookies are enabled: a "

@@ -138,6 +138,31 @@ implemented).
 - Capture has a stall watchdog (`stale_threshold.ytdlp_seconds`), and the
   heartbeat runs independently of everything so a stalled download can't make
   the worker look offline.
+- Incoming-queue hygiene: a queued URL is removed once its stream is confirmed
+  over, and a URL whose probes cannot determine liveness at all (private or
+  removed video, bot check, members-only entry, unknown status) is given up on
+  after `incoming_polling.inconclusive_delete_threshold` consecutive probes
+  spanning at least `incoming_polling.inconclusive_min_span_seconds`; probe
+  timeouts, yt-dlp network/rate-limit/extractor failures and other worker-side
+  errors never touch the queue. The worker re-reads the queue before a probe
+  when its copy is older than `incoming_polling.interval_seconds`, so a URL
+  removed on the admin page stops being probed within about one probe
+  interval.
+- A dead YouTube cookie jar (yt-dlp reports it is scraping anonymously) parks
+  YouTube URLs on `cookies.degraded_probe_interval_seconds` instead of acting
+  on verdicts it cannot trust. Overwrite the existing `cookies.txt` in place
+  (`cat new.txt > cookies.txt`, `cp new.txt cookies.txt`, or scp onto the
+  existing path) and the parked URLs are re-probed at once without a restart.
+  Never replace it by rename (`mv`, `rsync` without `--inplace`, an editor's
+  atomic save): the deployed stack bind-mounts the single file into the
+  container, so a rename leaves the container and yt-dlp on the old inode and
+  the worker cannot see the new jar (no "cookies.txt changed" log line
+  appears). If that has already happened, restart the worker container. One
+  more yt-dlp habit to know: it writes its in-memory jar back when it exits,
+  so a capture that was already running when you overwrote a shared
+  `cookies.txt` puts the old cookies back when it ends. Point
+  `check_filename` and `download_filename` at different files, or copy the
+  jar again after the capture.
 - Graceful shutdown on SIGINT/SIGTERM: capture unwinds, the transcription
   backlog drains within a bounded budget, pending uploads get a final window,
   every live channel is deactivated.

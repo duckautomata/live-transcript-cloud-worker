@@ -92,7 +92,10 @@ class CookieAuthTracker:
     def degraded(self) -> bool:
         """True when yt-dlp is scraping YouTube anonymously.
 
-        Read by the watcher so a cookie outage cannot drain the incoming queue.
+        Read by the watcher: while degraded no YouTube verdict counts as
+        offline (a signed-out probe cannot tell an ended stream from one it is
+        not allowed to see), the URL is parked on the slow degraded cadence,
+        and only the bounded inconclusive give-up can remove a queued URL.
         """
         return self.state in (CookieAuth.ABSENT, CookieAuth.ROTATED)
 

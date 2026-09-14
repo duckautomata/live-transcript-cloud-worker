@@ -220,3 +220,51 @@ def test_garbage_numeric_scalars_raise_config_error(tmp_path):
     )
     with pytest.raises(ConfigError, match="interval_seconds must be a number"):
         load_config(write(tmp_path, text), tmp_path)
+
+
+def test_incoming_queue_thresholds_parse_and_default(tmp_path):
+    config = load_config(write(tmp_path, VALID), tmp_path)
+    assert config.server.incoming_polling.inconclusive_delete_threshold == 10
+    assert config.server.cookies.degraded_probe_interval_seconds == 600.0
+
+    text = VALID.replace(
+        "url: https://server.example",
+        "url: https://server.example\n  incoming_polling:\n    inconclusive_delete_threshold: 0\n  cookies:\n    degraded_probe_interval_seconds: 120",
+    )
+    config = load_config(write(tmp_path, text), tmp_path)
+    assert config.server.incoming_polling.inconclusive_delete_threshold == 0  # 0 = never give up
+    assert config.server.cookies.degraded_probe_interval_seconds == 120.0
+
+
+def test_incoming_queue_thresholds_are_validated(tmp_path):
+    def with_incoming(body: str) -> str:
+        return VALID.replace("url: https://server.example", f"url: https://server.example\n  incoming_polling:\n{body}")
+
+    with pytest.raises(ConfigError, match="inconclusive_delete_threshold must be a number"):
+        load_config(write(tmp_path, with_incoming("    inconclusive_delete_threshold: lots")), tmp_path)
+    with pytest.raises(ConfigError, match="inconclusive_delete_threshold must be >= 0"):
+        load_config(write(tmp_path, with_incoming("    inconclusive_delete_threshold: -1")), tmp_path)
+    with pytest.raises(ConfigError, match="offline_delete_threshold must be >= 1"):
+        load_config(write(tmp_path, with_incoming("    offline_delete_threshold: 0")), tmp_path)
+    with pytest.raises(ConfigError, match="incoming_polling.interval_seconds must be > 0"):
+        load_config(write(tmp_path, with_incoming("    interval_seconds: 0")), tmp_path)
+    text = VALID.replace("url: https://server.example", "url: https://server.example\n  cookies:\n    degraded_probe_interval_seconds: 0")
+    with pytest.raises(ConfigError, match="degraded_probe_interval_seconds must be > 0"):
+        load_config(write(tmp_path, text), tmp_path)
+    # A typo under incoming_polling is still rejected.
+    with pytest.raises(ConfigError, match="unknown key.*incoming_polling"):
+        load_config(write(tmp_path, with_incoming("    inconclusive_delete_treshold: 3")), tmp_path)
+
+
+def test_inconclusive_min_span_parses_and_validates(tmp_path):
+    config = load_config(write(tmp_path, VALID), tmp_path)
+    assert config.server.incoming_polling.inconclusive_min_span_seconds == 3600.0
+    text = VALID.replace(
+        "url: https://server.example", "url: https://server.example\n  incoming_polling:\n    inconclusive_min_span_seconds: 0"
+    )
+    assert load_config(write(tmp_path, text), tmp_path).server.incoming_polling.inconclusive_min_span_seconds == 0.0
+    text = VALID.replace(
+        "url: https://server.example", "url: https://server.example\n  incoming_polling:\n    inconclusive_min_span_seconds: -5"
+    )
+    with pytest.raises(ConfigError, match="inconclusive_min_span_seconds must be >= 0"):
+        load_config(write(tmp_path, text), tmp_path)
