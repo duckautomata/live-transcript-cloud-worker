@@ -158,7 +158,13 @@ async def capture_stream(
 
     seq = 0
     last_progress = time.time()
+    # Segments can keep arriving while carrying nothing decodable (a wedged
+    # upstream connection); that resets last_progress, so usable audio gets
+    # its own clock.
+    last_usable = time.time()
     stale_after = config.server.stale_threshold.ytdlp_seconds
+    no_audio_after = config.server.stale_threshold.no_audio_seconds
+    skipped_since_usable = 0
     stopping = False
 
     try:
@@ -180,14 +186,29 @@ async def capture_stream(
                 # The children write to the log via their own O_APPEND fds,
                 # so the cap must be enforced from here during the session.
                 state.ytdlp_log.enforce_cap()
-                if chunk is not None:
-                    if chunk.duration >= config.transcription.min_chunk_seconds:
-                        stats.segments_emitted += 1
-                        await emit(chunk)
-                    else:
+                if chunk is not None and chunk.duration >= config.transcription.min_chunk_seconds:
+                    last_usable = time.time()
+                    skipped_since_usable = 0
+                    stats.segments_emitted += 1
+                    await emit(chunk)
+                else:
+                    skipped_since_usable += 1
+                    if chunk is not None:
                         # Too short to be a real line (docs/03), no ID is
                         # ever assigned.
                         chunk.path.unlink(missing_ok=True)
+                    if not stopping and time.time() - last_usable > no_audio_after:
+                        # The watcher re-probes right after capture returns
+                        # and reconnects with a fresh yt-dlp if still live.
+                        logger.warning(
+                            "[%s] %d segment(s) over %.0fs with no usable audio; restarting capture",
+                            key,
+                            skipped_since_usable,
+                            time.time() - last_usable,
+                        )
+                        stopping = True
+                        await _terminate(ytdlp)
+                        await _terminate(ffmpeg)
                 continue
 
             if both_done:

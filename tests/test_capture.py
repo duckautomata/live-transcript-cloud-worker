@@ -126,6 +126,34 @@ async def test_capture_watchdog_terminates_wedged_ytdlp(tmp_path):
     assert time.monotonic() - started < 20  # watchdog fired, no 300s hang
 
 
+async def test_capture_restarts_when_segments_have_no_audio(tmp_path):
+    # Real-time, video-only stream: segments keep arriving (so the stall
+    # watchdog never fires) but none decode to audio. The fake would run for
+    # 300s; the no-audio watchdog must end capture long before that.
+    ytdlp = fake_ytdlp(
+        tmp_path,
+        f'exec "{ffmpeg}" -loglevel error -re -f lavfi -i testsrc=size=64x64:rate=10:duration=300 -c:v mpeg2video -g 10 -f mpegts -',
+    )
+    config = make_config(
+        tmp_path,
+        server=ServerConfig(
+            api_key="k",
+            url="http://s.test",
+            enabled=True,
+            buffer_size_seconds=2.0,
+            stale_threshold=StaleThresholdConfig(ytdlp_seconds=180.0, no_audio_seconds=3.0),
+        ),
+        capture=CaptureConfig(yt_dlp_path=str(ytdlp), ffmpeg_path=ffmpeg, live_latency_seconds=1.0),
+    )
+    state = ChannelState("chan", tmp_path / "tmp" / "chan")
+
+    started = time.monotonic()
+    stats, emitted = await run_capture(config, state)
+    assert emitted == []
+    assert stats.segments_emitted == 0
+    assert time.monotonic() - started < 30
+
+
 async def test_capture_stop_signal_flushes_and_returns(tmp_path, tone_ts):
     # Stream the tone then hold the pipe open forever, like a live stream.
     ytdlp = fake_ytdlp(tmp_path, f'cat "{tone_ts}"\nexec sleep 300')

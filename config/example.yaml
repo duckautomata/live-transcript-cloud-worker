@@ -111,6 +111,9 @@ server:
     lfs_gap_seconds: 600
     # No new segment/fragment for this long => terminate a wedged yt-dlp.
     ytdlp_seconds: 180
+    # Live-edge only: segments keep arriving but none carry usable audio for
+    # this long => restart capture with a fresh yt-dlp connection.
+    no_audio_seconds: 60
 
 capture:
   # Paths to external binaries (absolute, or resolved on PATH).

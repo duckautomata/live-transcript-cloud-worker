@@ -102,7 +102,8 @@ segment -segment_format mpegts`), producing independently decodable,
 byte-concatenable chunks, the format the server's clip pipeline requires.
 Timestamps are estimated from each segment's own write time and self-heal
 after stalls. A stall watchdog (`stale_threshold.ytdlp_seconds`) terminates a
-wedged yt-dlp.
+wedged yt-dlp, and a no-audio watchdog (`stale_threshold.no_audio_seconds`)
+reconnects when segments keep arriving but none carry usable audio.
 
 **YouTube DASH** (`use_dash_for_youtube: true`) downloads the stream's
 fragments from second zero, merges each sequence with ffmpeg, and emits

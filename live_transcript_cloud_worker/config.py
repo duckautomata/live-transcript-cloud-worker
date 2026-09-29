@@ -79,6 +79,9 @@ class StaleThresholdConfig:
     lfs_gap_seconds: float = 600.0
     # No new segment/fragment for this long => terminate a wedged yt-dlp.
     ytdlp_seconds: float = 180.0
+    # Live-edge only: segments keep arriving but none carry usable audio for
+    # this long => restart capture with a fresh yt-dlp connection.
+    no_audio_seconds: float = 60.0
 
 
 @dataclass(frozen=True)
