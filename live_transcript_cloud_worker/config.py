@@ -109,6 +109,10 @@ class CaptureConfig:
     ffmpeg_path: str = "ffmpeg"
     # Live-edge timestamp anchoring: mtime - duration - live_latency_seconds.
     live_latency_seconds: float = 1.0
+    # Added to live_latency_seconds for YouTube streamers in video mode. With
+    # yt-dlp's merge keeping source timestamps (see capture.py), YouTube's
+    # video track, which reaches us ~1s after its audio, closes each segment.
+    youtube_video_extra_latency_seconds: float = 1.0
     # Process-wide cap on concurrent yt-dlp -j probes (docs/07 §7).
     probe_concurrency: int = 4
     probe_timeout_seconds: float = 30.0

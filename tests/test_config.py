@@ -268,3 +268,11 @@ def test_inconclusive_min_span_parses_and_validates(tmp_path):
     )
     with pytest.raises(ConfigError, match="inconclusive_min_span_seconds must be >= 0"):
         load_config(write(tmp_path, text), tmp_path)
+
+
+def test_youtube_video_extra_latency_parses_and_defaults(tmp_path):
+    config = load_config(write(tmp_path, VALID), tmp_path)
+    assert config.capture.youtube_video_extra_latency_seconds == 1.0
+    text = VALID + "capture:\n  youtube_video_extra_latency_seconds: 1.5\n"
+    config = load_config(write(tmp_path, text), tmp_path)
+    assert config.capture.youtube_video_extra_latency_seconds == 1.5

@@ -9,11 +9,22 @@ One pipeline shape for every platform (docs/03):
 ffmpeg cuts keyframe-aligned MPEG-TS segments; segment N is safe to consume
 once chunk N+1 exists (proving N is complete) or both processes have exited.
 
+YouTube serves video and audio as separate HLS streams, so in video mode
+yt-dlp merges the two with its own ffmpeg before the pipe. That merge runs
+with ``-copyts``: without it ffmpeg rebases each input to zero on its own,
+and because the audio input is opened seconds after the video one, the gap
+becomes a fixed offset with the video 1-5s behind the audio, re-rolled on
+every yt-dlp start. The two streams share one clock, so keeping the source
+timestamps keeps them aligned.
+
 Capture joins at the live edge (never ``--live-from-start``), so timestamps
 are estimated: each segment is anchored independently at
 ``mtime - duration - live_latency``, ffmpeg stamps a segment's mtime when it
 finishes writing it, so the anchor is a real ingestion clock that self-heals
 after stalls instead of drifting. All lines are ``vodAccurate: false``.
+YouTube video adds ``youtube_video_extra_latency_seconds`` to the latency:
+its video track reaches us later than its audio, and with the two aligned
+the video is what closes each segment.
 """
 
 from __future__ import annotations
@@ -29,9 +40,9 @@ from pathlib import Path
 
 from . import audio
 from .config import Config, StreamerConfig
-from .models import Chunk, MediaType, StreamInfo
+from .models import Chunk, MediaType, Platform, StreamInfo
 from .state import ChannelState
-from .ytdlp import auth_args
+from .ytdlp import auth_args, platform_of
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +74,23 @@ def _ytdlp_cmd(config: Config, streamer: StreamerConfig, url: str) -> list[str]:
         fmt,
         "-S",
         FORMAT_SORT,
+        # Keep source timestamps through the two-input merge (see the module
+        # docstring). yt-dlp only places ffmpeg_i2 args before a second
+        # input, so single-stream downloads (Twitch, audio) are untouched.
+        "--downloader-args",
+        "ffmpeg_i2:-copyts",
         "-o",
         "-",
         url,
     ]
+
+
+def _live_latency(config: Config, streamer: StreamerConfig, info: StreamInfo) -> float:
+    """How long after a segment's audio aired ffmpeg finishes writing it."""
+    latency = config.capture.live_latency_seconds
+    if streamer.media_type is MediaType.VIDEO and platform_of(info.url) is Platform.YOUTUBE:
+        latency += config.capture.youtube_video_extra_latency_seconds
+    return latency
 
 
 def _ffmpeg_cmd(config: Config, segment_dir: Path) -> list[str]:
@@ -279,7 +303,7 @@ async def _consume_segment(
         key=streamer.key,
         stream_id=info.stream_id,
         path=path,
-        audio_start_time=mtime - duration - config.capture.live_latency_seconds,
+        audio_start_time=mtime - duration - _live_latency(config, streamer, info),
         duration=duration,
         vod_accurate=False,
         media_type=streamer.media_type,

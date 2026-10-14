@@ -191,3 +191,47 @@ async def test_consume_segment_garbage_skipped(tmp_path):
     chunk = await capture._consume_segment(config, STREAMER, INFO, garbage)
     assert chunk is None
     assert not garbage.exists()
+
+
+YOUTUBE_INFO = StreamInfo(url="https://www.youtube.com/watch?v=abc123", stream_id="abc123", title="T", is_live=True)
+TWITCH_INFO = StreamInfo(url="https://www.twitch.tv/chan", stream_id="v1", title="T", is_live=True)
+VIDEO_STREAMER = StreamerConfig(key="chan", urls=("u",), media_type=MediaType.VIDEO)
+
+
+def test_ytdlp_cmd_keeps_source_timestamps_through_merge(tmp_path):
+    config = capture_config(tmp_path, tmp_path / "unused")
+    cmd = capture._ytdlp_cmd(config, VIDEO_STREAMER, YOUTUBE_INFO.url)
+    i = cmd.index("--downloader-args")
+    assert cmd[i + 1] == "ffmpeg_i2:-copyts"
+    # Downloader args must precede the output and the URL.
+    assert i < cmd.index("-o")
+    assert cmd[-1] == YOUTUBE_INFO.url
+
+
+@pytest.mark.parametrize(
+    ("streamer", "info", "expected"),
+    [
+        (VIDEO_STREAMER, YOUTUBE_INFO, 1.0 + 1.5),
+        (STREAMER, YOUTUBE_INFO, 1.0),  # audio: single input, no merge
+        (VIDEO_STREAMER, TWITCH_INFO, 1.0),  # Twitch: one muxed stream
+    ],
+)
+def test_live_latency_extra_is_youtube_video_only(tmp_path, streamer, info, expected):
+    config = make_config(
+        tmp_path,
+        capture=CaptureConfig(live_latency_seconds=1.0, youtube_video_extra_latency_seconds=1.5),
+    )
+    assert capture._live_latency(config, streamer, info) == pytest.approx(expected)
+
+
+async def test_consume_segment_anchors_youtube_video_with_extra_latency(tmp_path, tone_ts):
+    config = make_config(
+        tmp_path,
+        capture=CaptureConfig(ffmpeg_path=ffmpeg, live_latency_seconds=1.0, youtube_video_extra_latency_seconds=1.5),
+    )
+    segment = tmp_path / "chunk000000.ts"
+    shutil.copyfile(tone_ts, segment)
+    chunk = await capture._consume_segment(config, VIDEO_STREAMER, YOUTUBE_INFO, segment)
+    assert chunk is not None
+    mtime = segment.stat().st_mtime
+    assert chunk.audio_start_time == pytest.approx(mtime - chunk.duration - 2.5, abs=0.01)

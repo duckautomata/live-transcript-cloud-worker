@@ -121,6 +121,11 @@ capture:
   ffmpeg_path: ffmpeg
   # Live-edge timestamp anchor: segment_mtime - duration - this.
   live_latency_seconds: 1
+  # Added to live_latency_seconds for YouTube streamers with media_type
+  # video only. YouTube's video track reaches the worker ~1s after its
+  # audio, and with the two kept in sync the video decides when each
+  # segment closes. Measured on a 1s-segment stream; may need tuning.
+  youtube_video_extra_latency_seconds: 1
   # Process-wide cap on concurrent yt-dlp -j probes.
   probe_concurrency: 4
   probe_timeout_seconds: 30
