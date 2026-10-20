@@ -33,8 +33,8 @@ import logging
 import random
 import time
 
-from . import capture_dash
 from .capture import capture_stream
+from .capture_timeline import TimelineCapture
 from .config import Config, StreamerConfig
 from .models import ProbeResult, StreamInfo
 from .pipeline import StreamPipeline
@@ -122,6 +122,10 @@ class ChannelWatcher:
         self._pending_deactivate = ""
         # Last cookies.txt generation seen (see _wake_parked_if_jar_replaced).
         self._jar_generation = getattr(prober, "jar_generation", 0)
+        # One per channel, kept across captures: its yt-dlp pacing and backoff
+        # must survive a run ending and the watcher re-capturing the same
+        # stream, or a flapping stream would re-resolve on every round.
+        self._timeline = TimelineCapture(config, streamer, state)
         if not self._incoming_mode:
             for url in streamer.urls:
                 self._schedules[url] = _UrlSchedule()
@@ -466,31 +470,22 @@ class ChannelWatcher:
         return True
 
     async def _capture(self, info: StreamInfo, emit) -> None:
-        """Strategy selection (docs/03): YouTube uses DASH live-from-start
-        when ``use_dash_for_youtube`` is set (exact timestamps, captures from
-        second zero); everything else, Twitch included, captures at the
-        live edge. DASH falls back to live-edge when it fails early or falls
-        too far behind."""
-        key = self.streamer.key
-        use_dash = self.config.server.use_dash_for_youtube and platform_of(info.url) is Platform.YOUTUBE
-        if use_dash:
-            # Pre-flight gap check: if catching up would take longer than the
-            # stream likely has left, skip straight to live-edge (docs/03).
-            start = float(info.start_time or time.time())
-            resume = capture_dash.resume_point(self.state, info.stream_id, start)
-            behind = time.time() - resume
-            if behind > self.config.server.stale_threshold.lfs_gap_seconds:
-                logger.info(
-                    "[%s] DASH resume point is %.0fs behind live (> lfs_gap %.0fs); using live-edge",
-                    key,
-                    behind,
-                    self.config.server.stale_threshold.lfs_gap_seconds,
-                )
-            else:
-                stats = await capture_dash.capture_stream_dash(self.config, self.streamer, self.state, info, emit, self._should_stop)
-                if self._should_stop() or not stats.fell_behind:
-                    return  # stream ended (or we're stopping) under DASH
-                logger.warning("[%s] continuing stream %s with live-edge capture", key, info.stream_id)
+        """Strategy selection: a YouTube URL on a streamer with
+        ``use_youtube_timeline`` is captured by the YouTube timeline (joins at
+        the live edge, stamps every line with YouTube's own media clock, so
+        lines are VOD-accurate); everything else, Twitch included, captures
+        at the live edge with estimated timestamps.
+
+        The timeline is exclusive: however its run ends, this capture round
+        is over and the watcher re-probes, it never continues the stream on
+        live-edge capture, so no line of it is ever approximate. The run ends
+        on its own only once the stream is over (yt-dlp says it is not live or
+        cannot be watched, or the playlist ends); a frozen playlist, rejected
+        URLs or unusable data it rides out by reconnecting."""
+        if self.streamer.use_youtube_timeline and platform_of(info.url) is Platform.YOUTUBE:
+            logger.info("[%s] use_youtube_timeline=true: capturing %s with the YouTube timeline", self.streamer.key, info.stream_id)
+            await self._timeline.run(info, emit, self._should_stop)
+            return
         await capture_stream(self.config, self.streamer, self.state, info, emit, self._should_stop)
 
     # ------------------------------------------------------------- restart
@@ -501,9 +496,9 @@ class ChannelWatcher:
         A restart serves two operator intents, and both must work:
 
         - **Reconnect**: force yt-dlp to re-attach to a stream that's still
-          live. Channel state (transcript, nextLineId, DASH resume) is KEPT,
-          so the re-detected stream resumes at the next line via the same-ID
-          reactivation path, never a restart from line 0.
+          live. Channel state (transcript, nextLineId, the YouTube timeline's
+          resume point) is KEPT, so the re-detected stream resumes at the next
+          line via the same-ID reactivation path, never a restart from line 0.
         - **Stop** (the admin-stop button, which also clears the server's
           incoming queue): in incoming mode the local URL set is rebuilt
           from the server's queue rather than reused, keeping the stale set

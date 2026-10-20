@@ -14,8 +14,8 @@ A 6-second chunk is ~192 KB of WAV, well inside every provider limit.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
-import re
 import struct
 from pathlib import Path
 
@@ -56,9 +56,14 @@ async def extract_pcm(ffmpeg_path: str, media_path: Path, timeout: float = 30.0)
         try:
             pcm, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         except TimeoutError:
-            proc.kill()
-            await proc.wait()
             raise AudioExtractError(f"ffmpeg timed out decoding {media_path.name}") from None
+        finally:
+            # Timed out, or the capture calling this was cancelled: ffmpeg must
+            # not outlive the call (nobody would read its output any more).
+            if proc.returncode is None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
     except OSError as exc:
         raise AudioExtractError(f"could not run ffmpeg: {exc}") from exc
 
@@ -69,34 +74,6 @@ async def extract_pcm(ffmpeg_path: str, media_path: Path, timeout: float = 30.0)
 
 def pcm_duration(pcm: bytes) -> float:
     return len(pcm) / BYTES_PER_SECOND
-
-
-_DURATION_RE = re.compile(rb"Duration: (\d+):(\d+):(\d+(?:\.\d+)?)")
-
-
-async def container_duration(ffmpeg_path: str, media_path: Path, timeout: float = 15.0) -> float:
-    """Container-metadata duration, from ffmpeg's probe banner.
-
-    The docs/03 fallback clock: used only when a span has no decodable audio
-    (e.g. a video-only DASH sequence), decoded sample count stays the master
-    clock everywhere else. Returns 0.0 when no duration is discernible.
-    """
-    cmd = [ffmpeg_path, "-hide_banner", "-i", str(media_path)]
-    try:
-        proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE)
-        try:
-            _, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-        except TimeoutError:
-            proc.kill()
-            await proc.wait()
-            return 0.0
-    except OSError:
-        return 0.0
-    match = _DURATION_RE.search(stderr)
-    if not match:
-        return 0.0
-    hours, minutes, seconds = match.groups()
-    return int(hours) * 3600 + int(minutes) * 60 + float(seconds)
 
 
 def pcm_to_wav(pcm: bytes) -> bytes:

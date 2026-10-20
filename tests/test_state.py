@@ -132,3 +132,29 @@ def test_corrupt_meta_starts_fresh(tmp_path: Path):
     (root / "meta.json").write_bytes(b"{not json")
     state = ChannelState("chan", root)
     assert state.stream_id == ""
+
+
+def test_remove_legacy_dash_files(tmp_path: Path, caplog):
+    """The removed DASH capture's leftovers go at boot; nothing else does."""
+    root = tmp_path / "chan"
+    fragments = root / "fragments"
+    fragments.mkdir(parents=True)
+    (fragments / "vid1.f140.Frag7").write_bytes(b"frag")
+    (fragments / "merged_7.ts").write_bytes(b"ts")
+    (root / "dash_state.json").write_text('{"stream_id": "vid1", "last_sequence": 7}')
+    (root / "youtube_timeline_state.json").write_text('{"stream_id": "vid1", "next_sequence": 8}')
+    state = ChannelState("chan", root)
+
+    with caplog.at_level("INFO"):
+        state.remove_legacy_dash_files()
+
+    assert not fragments.exists()
+    assert not (root / "dash_state.json").exists()
+    assert (root / "youtube_timeline_state.json").exists()
+    assert state.queue_dir.is_dir() and state.segments_dir.is_dir()
+    assert "removed leftovers of the old DASH capture: fragments/, dash_state.json" in caplog.text
+
+    # Nothing left: a no-op that logs nothing.
+    caplog.clear()
+    state.remove_legacy_dash_files()
+    assert "DASH" not in caplog.text

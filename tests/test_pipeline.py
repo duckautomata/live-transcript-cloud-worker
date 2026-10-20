@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 
 from conftest import make_config
@@ -164,3 +165,30 @@ async def test_empty_segment_text_is_dropped_but_line_emitted(tmp_path):
     pipeline, _, server, _ = build(tmp_path, transcriber=transcriber)
     await run_pipeline(pipeline, [make_chunk(tmp_path, 0)])
     assert server.lines[0][1]["segments"] == [{"timestamp": 1001, "text": "keep"}]
+
+
+async def test_lag_of_a_clock_stamped_line_is_measured_from_capture(tmp_path, caplog):
+    """A stamp from the stream's clock skips the time the stream was down, so
+    measured from the stamp every outage would make each later line look
+    minutes late: lag_from is where the capture says to measure from."""
+    pipeline, _, _, _ = build(tmp_path)
+    chunk = Chunk(**{**make_chunk(tmp_path, 0).__dict__, "lag_from": time.time()})  # stamped at t=1000, decades ago
+    caplog.set_level("DEBUG", logger="live_transcript_cloud_worker.pipeline")
+    await run_pipeline(pipeline, [chunk])
+    assert "since capture" in caplog.text
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
+async def test_a_clock_stamped_line_that_waited_still_warns(tmp_path, caplog):
+    pipeline, _, _, _ = build(tmp_path)
+    chunk = Chunk(**{**make_chunk(tmp_path, 0).__dict__, "lag_from": time.time() - 60})
+    caplog.set_level("DEBUG", logger="live_transcript_cloud_worker.pipeline")
+    await run_pipeline(pipeline, [chunk])
+    assert any(r.levelname == "WARNING" and "since capture" in r.getMessage() for r in caplog.records)
+
+
+async def test_lag_of_an_arrival_stamped_line_is_measured_from_the_audio_edge(tmp_path, caplog):
+    pipeline, _, _, _ = build(tmp_path)
+    caplog.set_level("DEBUG", logger="live_transcript_cloud_worker.pipeline")
+    await run_pipeline(pipeline, [make_chunk(tmp_path, 0)])  # lag_from None, audio ended decades ago
+    assert any(r.levelname == "WARNING" and "behind the audio edge" in r.getMessage() for r in caplog.records)

@@ -14,17 +14,9 @@ server:
   # tmp/{key}/transcript.text instead. Essential for local development.
   enabled: true
 
-  # Target chunk/line duration in seconds (ffmpeg -segment_time).
+  # Target chunk/line duration in seconds (live-edge: ffmpeg -segment_time;
+  # YouTube timeline: each chunk closes at the segment boundary nearest it).
   buffer_size_seconds: 6
-
-  # YouTube only: use the fragment-based DASH live-from-start strategy,
-  # captures the stream from second zero with exact (vodAccurate) timestamps,
-  # falling back to live-edge if it fails or falls too far behind.
-  # NOTE: DASH must be turned OFF when cookies are enabled, a
-  # --live-from-start backfill is a long-lived authenticated download burst,
-  # exactly the pattern that gets accounts flagged. The config refuses to
-  # start with both enabled. Twitch always captures at the live edge.
-  use_dash_for_youtube: false
 
   # Concurrent media uploads (shared across channels, round-robin fair).
   media_upload_concurrency: 3
@@ -103,26 +95,32 @@ server:
     degraded_probe_interval_seconds: 600
 
   stale_threshold:
-    # DASH only: wait this long for a fragment sequence's tracks to complete
-    # before emitting it with partial data.
-    fragment_seconds: 60
-    # DASH only: falling this far behind live switches to live-edge capture
-    # for the rest of the stream (also the pre-flight catch-up cutoff).
+    # YouTube timeline: catch up on missed segments from at most this far
+    # behind live (after a hiccup or a restart); further behind, jump to the
+    # live edge. Time spent waiting on a backed-up pipeline (transcription or
+    # the server falling behind) widens it, so a backlog of our own doesn't
+    # skip segments YouTube still serves. It also waits at most half of this
+    # between failed yt-dlp runs, so a stream coming back from an outage is
+    # never skipped.
     lfs_gap_seconds: 600
-    # No new segment/fragment for this long => terminate a wedged yt-dlp.
+    # Live-edge only: no new segment for this long => terminate a wedged yt-dlp.
     ytdlp_seconds: 180
-    # Live-edge only: segments keep arriving but none carry usable audio for
-    # this long => restart capture with a fresh yt-dlp connection.
+    # Segments keep arriving but none carry usable audio for this long =>
+    # the connection is assumed broken. Live-edge restarts capture with a
+    # fresh yt-dlp connection; the YouTube timeline re-resolves the stream
+    # and reconnects.
     no_audio_seconds: 60
 
 capture:
   # Paths to external binaries (absolute, or resolved on PATH).
   yt_dlp_path: yt-dlp
   ffmpeg_path: ffmpeg
-  # Live-edge timestamp anchor: segment_mtime - duration - this.
+  # Live-edge timestamp anchor: segment_mtime - duration - this. The YouTube
+  # timeline uses it too, for a chunk whose clock can't be trusted (stamped
+  # by arrival: now - duration - this, not VOD-accurate).
   live_latency_seconds: 1
-  # Added to live_latency_seconds for YouTube streamers with media_type
-  # video only. YouTube's video track reaches the worker ~1s after its
+  # Live-edge only: added to live_latency_seconds for YouTube streamers with
+  # media_type video. YouTube's video track reaches the worker ~1s after its
   # audio, and with the two kept in sync the video decides when each
   # segment closes. Measured on a 1s-segment stream; may need tuning.
   youtube_video_extra_latency_seconds: 1
@@ -174,6 +172,13 @@ streamers:
       - https://www.twitch.tv/example
     active: true
     media_type: none # none | audio | video
+    # YouTube only. If true, this streamer's YouTube streams are captured with
+    # the YouTube timeline: it joins at the live edge but stamps every line
+    # with YouTube's own clock, so every line is VOD-accurate (even with DVR
+    # disabled). It is used exclusively: there is no fallback to live-edge
+    # capture. Works with cookies enabled. Twitch URLs are unaffected.
+    # Must be an unquoted true/false.
+    use_youtube_timeline: false
 
 # Stream IDs never to transcribe (e.g. a 24/7 loop).
 id_blacklist: []

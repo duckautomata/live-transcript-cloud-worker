@@ -42,6 +42,7 @@ async def run_app(config: Config) -> int:
     states = {s.key: ChannelState(s.key, config.channel_dir(s.key)) for s in streamers}
     for state in states.values():
         state.clear_segments_dir()
+        state.remove_legacy_dash_files()
 
     server = ServerClient(config) if config.server.enabled else LocalClient(config)
     transcriber = TranscriptionService(config.transcription)

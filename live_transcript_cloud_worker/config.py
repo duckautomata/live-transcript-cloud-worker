@@ -71,16 +71,16 @@ class CookiesConfig:
 
 @dataclass(frozen=True)
 class StaleThresholdConfig:
-    # DASH only: wait this long for a sequence's tracks to complete before
-    # emitting it with partial data.
-    fragment_seconds: float = 60.0
-    # DASH only: falling this far behind live abandons catch-up and switches
-    # to live-edge capture for the rest of the stream.
+    # YouTube timeline: catch up on missed segments from at most this far
+    # behind live (after a hiccup or a restart); further behind, jump to the
+    # live edge. Time spent waiting on a backed-up pipeline widens it. Also
+    # caps the wait between failed yt-dlp resolutions at half of this.
     lfs_gap_seconds: float = 600.0
-    # No new segment/fragment for this long => terminate a wedged yt-dlp.
+    # Live-edge only: no new segment for this long => terminate a wedged yt-dlp.
     ytdlp_seconds: float = 180.0
-    # Live-edge only: segments keep arriving but none carry usable audio for
-    # this long => restart capture with a fresh yt-dlp connection.
+    # Segments keep arriving but none carry usable audio for this long =>
+    # live-edge restarts capture with a fresh yt-dlp connection; the YouTube
+    # timeline re-resolves the stream and reconnects.
     no_audio_seconds: float = 60.0
 
 
@@ -89,12 +89,9 @@ class ServerConfig:
     api_key: str = ""
     url: str = ""
     enabled: bool = True
+    # Target chunk/line duration: live-edge's ffmpeg -segment_time; the
+    # YouTube timeline closes each chunk at the segment boundary nearest it.
     buffer_size_seconds: float = 6.0
-    # YouTube only: capture with the fragment-based DASH live-from-start
-    # strategy (exact vodAccurate timestamps, catches the stream from second
-    # zero). Must be OFF when cookies are enabled. Twitch always uses
-    # live-edge regardless of this setting.
-    use_dash_for_youtube: bool = False
     media_upload_concurrency: int = 3
     incoming_polling: IncomingPollingConfig = field(default_factory=IncomingPollingConfig)
     events_polling: EventsPollingConfig = field(default_factory=EventsPollingConfig)
@@ -108,10 +105,13 @@ class CaptureConfig:
     yt_dlp_path: str = "yt-dlp"
     ffmpeg_path: str = "ffmpeg"
     # Live-edge timestamp anchoring: mtime - duration - live_latency_seconds.
+    # The YouTube timeline uses it too, for a chunk whose clock cannot be
+    # trusted: stamped by arrival, now - duration - live_latency_seconds.
     live_latency_seconds: float = 1.0
-    # Added to live_latency_seconds for YouTube streamers in video mode. With
-    # yt-dlp's merge keeping source timestamps (see capture.py), YouTube's
-    # video track, which reaches us ~1s after its audio, closes each segment.
+    # Live-edge only: added to live_latency_seconds for YouTube streamers in
+    # video mode. With yt-dlp's merge keeping source timestamps (see
+    # capture.py), YouTube's video track, which reaches us ~1s after its
+    # audio, closes each segment.
     youtube_video_extra_latency_seconds: float = 1.0
     # Process-wide cap on concurrent yt-dlp -j probes (docs/07 §7).
     probe_concurrency: int = 4
@@ -146,6 +146,14 @@ class StreamerConfig:
     urls: tuple[str, ...] = ()
     active: bool = True
     media_type: MediaType = MediaType.NONE
+    # YouTube only: capture this streamer's YouTube streams with the YouTube
+    # timeline (capture_timeline.py). It joins at the live edge but stamps
+    # every line with YouTube's own media clock, so every line is VOD-accurate
+    # (even with DVR disabled). Used exclusively: there is no fallback to
+    # live-edge capture. Twitch URLs are unaffected. Fine with cookies: its
+    # authenticated traffic is one paced yt-dlp -j per connection, and the
+    # segments themselves come from signed URLs.
+    use_youtube_timeline: bool = False
 
 
 @dataclass(frozen=True)
@@ -171,6 +179,23 @@ class Config:
             return None
         name = cookies.check_filename if which == "check" else cookies.download_filename
         return self.base_dir / name
+
+
+# Keys that went away with the DASH (--live-from-start) capture. Unknown keys
+# are rejected anyway; these get a message naming what replaced them, so an
+# old config fails with a pointer instead of a bare "unknown key".
+_REMOVED_WITH_DASH = "removed with DASH capture; delete it (for VOD-accurate YouTube lines, set streamers[].use_youtube_timeline: true)"
+
+
+def _reject_removed_keys(srv: dict[str, Any]) -> None:
+    removed = []
+    if "use_dash_for_youtube" in srv:
+        removed.append("server.use_dash_for_youtube")
+    stale = srv.get("stale_threshold")
+    if isinstance(stale, dict) and "fragment_seconds" in stale:
+        removed.append("server.stale_threshold.fragment_seconds")
+    if removed:
+        raise ConfigError("; ".join(f"{path} was {_REMOVED_WITH_DASH}" for path in removed))
 
 
 def _section(raw: Any, name: str) -> dict[str, Any]:
@@ -225,12 +250,12 @@ def load_config(config_path: Path, base_dir: Path | None = None) -> Config:
         raise ConfigError(f"unknown top-level key(s): {', '.join(sorted(unknown_top))}")
 
     srv = _section(raw, "server")
+    _reject_removed_keys(srv)
     known_server_keys = {
         "apiKey",
         "url",
         "enabled",
         "buffer_size_seconds",
-        "use_dash_for_youtube",
         "media_upload_concurrency",
         "incoming_polling",
         "events_polling",
@@ -246,7 +271,6 @@ def load_config(config_path: Path, base_dir: Path | None = None) -> Config:
         url=str(srv.get("url") or "").rstrip("/"),
         enabled=bool(srv.get("enabled", True)),
         buffer_size_seconds=_number(srv, "buffer_size_seconds", 6.0, float, "server"),
-        use_dash_for_youtube=bool(srv.get("use_dash_for_youtube", False)),
         media_upload_concurrency=_number(srv, "media_upload_concurrency", 3, int, "server"),
         incoming_polling=_build(IncomingPollingConfig, _section(srv, "incoming_polling"), "server.incoming_polling"),
         events_polling=_build(EventsPollingConfig, _section(srv, "events_polling"), "server.events_polling"),
@@ -298,7 +322,7 @@ def load_config(config_path: Path, base_dir: Path | None = None) -> Config:
     if not isinstance(streamers_raw, list):
         raise ConfigError("'streamers' must be a list")
     streamers = []
-    known_streamer_keys = {"key", "urls", "active", "media_type"}
+    known_streamer_keys = {"key", "urls", "active", "media_type", "use_youtube_timeline"}
     for i, entry in enumerate(streamers_raw):
         if not isinstance(entry, dict):
             raise ConfigError(f"streamers[{i}] must be a mapping")
@@ -309,12 +333,19 @@ def load_config(config_path: Path, base_dir: Path | None = None) -> Config:
             media_type = MediaType(str(entry.get("media_type", "none")))
         except ValueError:
             raise ConfigError(f"streamers[{i}].media_type must be one of none|audio|video, got {entry.get('media_type')!r}") from None
+        # Only a YAML boolean: it switches the capture strategy (and whether
+        # lines are VOD-accurate), so a quoted "true", a 1, or a blank value
+        # is a mistake to report rather than a guess to make.
+        use_youtube_timeline = entry.get("use_youtube_timeline", False)
+        if not isinstance(use_youtube_timeline, bool):
+            raise ConfigError(f"streamers[{i}].use_youtube_timeline must be true or false, got {use_youtube_timeline!r}")
         streamers.append(
             StreamerConfig(
                 key=str(entry.get("key", "")),
                 urls=tuple(str(u) for u in (entry.get("urls") or [])),
                 active=bool(entry.get("active", True)),
                 media_type=media_type,
+                use_youtube_timeline=use_youtube_timeline,
             )
         )
 
@@ -354,12 +385,6 @@ def _validate(config: Config) -> None:
         problems.append("server.incoming_polling.inconclusive_min_span_seconds must be >= 0 (0 = count only)")
     if server.cookies.degraded_probe_interval_seconds <= 0:
         problems.append("server.cookies.degraded_probe_interval_seconds must be > 0")
-    if server.use_dash_for_youtube and server.cookies.enabled:
-        problems.append(
-            "use_dash_for_youtube must be turned off when cookies are enabled: a "
-            "--live-from-start backfill is a long-lived authenticated download "
-            "burst, exactly the pattern that gets accounts flagged"
-        )
 
     if not config.active_streamers:
         problems.append("no active streamers configured")

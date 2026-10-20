@@ -135,6 +135,8 @@ def test_example_config_parses(tmp_path, monkeypatch):
     config = load_config(example, tmp_path)
     assert config.transcription.provider == "deepgram"
     assert config.server.stale_threshold.ytdlp_seconds == 180
+    assert config.server.stale_threshold.lfs_gap_seconds == 600
+    assert config.streamers[0].use_youtube_timeline is False
 
 
 def test_unknown_provider_section_rejected(tmp_path):
@@ -164,30 +166,72 @@ def test_provider_env_overrides_populate_options(tmp_path, monkeypatch):
 
 def test_streamer_live_from_start_rejected(tmp_path):
     # Per-streamer live_from_start was removed with Twitch LFS capture;
-    # DASH is toggled by server.use_dash_for_youtube instead.
+    # exact YouTube timestamps come from use_youtube_timeline instead.
     text = VALID.replace("media_type: audio", "media_type: audio\n    live_from_start: true")
     with pytest.raises(ConfigError, match="unknown key.*streamers"):
         load_config(write(tmp_path, text), tmp_path)
 
 
-def test_dash_config_accepted(tmp_path):
-    text = VALID.replace(
-        "url: https://server.example",
-        "url: https://server.example\n  use_dash_for_youtube: true\n  stale_threshold:\n    fragment_seconds: 30\n    lfs_gap_seconds: 300",
+def test_youtube_timeline_flag_parsed(tmp_path):
+    config = load_config(write(tmp_path, VALID), tmp_path)
+    assert config.streamers[0].use_youtube_timeline is False  # default
+
+    text = VALID.replace("media_type: audio", "media_type: audio\n    use_youtube_timeline: true")
+    config = load_config(write(tmp_path, text), tmp_path)
+    assert config.streamers[0].use_youtube_timeline is True
+
+    text = VALID.replace("media_type: audio", "media_type: audio\n    use_youtube_timeline: false")
+    assert load_config(write(tmp_path, text), tmp_path).streamers[0].use_youtube_timeline is False
+
+
+@pytest.mark.parametrize("value", ['"true"', "'false'", "1", "0", "", "null", "enabled"])
+def test_youtube_timeline_flag_must_be_a_real_bool(tmp_path, value):
+    """It switches the capture strategy and whether lines are VOD-accurate:
+    a quoted string, a number or a blank is reported, never guessed at."""
+    text = VALID.replace("media_type: audio", f"media_type: audio\n    use_youtube_timeline: {value}")
+    with pytest.raises(ConfigError, match=r"streamers\[0\]\.use_youtube_timeline must be true or false"):
+        load_config(write(tmp_path, text), tmp_path)
+
+
+def test_youtube_timeline_allowed_with_cookies(tmp_path):
+    # Unlike the old DASH capture there is no cookie restriction: its
+    # authenticated traffic is one paced yt-dlp -j per connection.
+    text = VALID.replace("url: https://server.example", "url: https://server.example\n  cookies:\n    enabled: true").replace(
+        "media_type: audio", "media_type: audio\n    use_youtube_timeline: true"
     )
     config = load_config(write(tmp_path, text), tmp_path)
-    assert config.server.use_dash_for_youtube
-    assert config.server.stale_threshold.fragment_seconds == 30
-    assert config.server.stale_threshold.lfs_gap_seconds == 300
+    assert config.server.cookies.enabled
+    assert config.streamers[0].use_youtube_timeline
 
 
-def test_dash_with_cookies_rejected(tmp_path):
-    text = VALID.replace(
-        "url: https://server.example",
-        "url: https://server.example\n  use_dash_for_youtube: true\n  cookies:\n    enabled: true",
-    )
-    with pytest.raises(ConfigError, match="use_dash_for_youtube must be turned off"):
+def test_lfs_gap_still_configurable(tmp_path):
+    assert load_config(write(tmp_path, VALID), tmp_path).server.stale_threshold.lfs_gap_seconds == 600.0
+    text = VALID.replace("url: https://server.example", "url: https://server.example\n  stale_threshold:\n    lfs_gap_seconds: 300")
+    assert load_config(write(tmp_path, text), tmp_path).server.stale_threshold.lfs_gap_seconds == 300.0
+
+
+@pytest.mark.parametrize(
+    "server_block, removed",
+    [
+        ("  use_dash_for_youtube: false", ["server.use_dash_for_youtube"]),
+        ("  stale_threshold:\n    fragment_seconds: 60", ["server.stale_threshold.fragment_seconds"]),
+        (
+            "  use_dash_for_youtube: true\n  stale_threshold:\n    fragment_seconds: 60\n    lfs_gap_seconds: 600",
+            ["server.use_dash_for_youtube", "server.stale_threshold.fragment_seconds"],
+        ),
+    ],
+)
+def test_removed_dash_keys_rejected_with_a_pointer(tmp_path, server_block, removed):
+    """An old config fails loudly, saying what replaced the key, not with a
+    bare "unknown key"."""
+    text = VALID.replace("url: https://server.example", f"url: https://server.example\n{server_block}")
+    with pytest.raises(ConfigError) as excinfo:
         load_config(write(tmp_path, text), tmp_path)
+    message = str(excinfo.value)
+    for path in removed:
+        assert f"{path} was removed with DASH capture" in message
+    assert "streamers[].use_youtube_timeline" in message
+    assert "unknown key" not in message
 
 
 def test_unknown_top_level_and_server_keys_rejected(tmp_path):

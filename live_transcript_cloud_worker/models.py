@@ -128,6 +128,11 @@ class Chunk:
     vod_accurate: bool
     media_type: MediaType
     pcm: bytes = field(repr=False, default=b"")
+    # Wall time to measure the line's lag from when its stamp isn't an arrival
+    # time: a stamp from the stream's own clock skips the time the stream was
+    # down, so measured from the stamp every outage would add to every later
+    # line's lag. None: from the end of the chunk's audio.
+    lag_from: float | None = None
 
 
 class ProbeResult(Enum):

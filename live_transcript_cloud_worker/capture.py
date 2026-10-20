@@ -17,11 +17,12 @@ becomes a fixed offset with the video 1-5s behind the audio, re-rolled on
 every yt-dlp start. The two streams share one clock, so keeping the source
 timestamps keeps them aligned.
 
-Capture joins at the live edge (never ``--live-from-start``), so timestamps
-are estimated: each segment is anchored independently at
-``mtime - duration - live_latency``, ffmpeg stamps a segment's mtime when it
-finishes writing it, so the anchor is a real ingestion clock that self-heals
-after stalls instead of drifting. All lines are ``vodAccurate: false``.
+Capture joins at the live edge, so timestamps are estimated: each segment
+is anchored independently at ``mtime - duration - live_latency``, ffmpeg
+stamps a segment's mtime when it finishes writing it, so the anchor is a real
+ingestion clock that self-heals after stalls instead of drifting. All lines
+are ``vodAccurate: false`` (for exact YouTube timestamps from the live edge,
+see capture_timeline.py).
 YouTube video adds ``youtube_video_extra_latency_seconds`` to the latency:
 its video track reaches us later than its audio, and with the two aligned
 the video is what closes each segment.
@@ -47,7 +48,6 @@ from .ytdlp import auth_args, platform_of
 logger = logging.getLogger(__name__)
 
 VIDEO_FORMAT = "b/bv+ba"  # stdout pipeline (live edge)
-DASH_VIDEO_FORMAT = "bv*+ba/b"  # fragments written to files (--live-from-start)
 AUDIO_FORMAT = "ba/b"
 FORMAT_SORT = "vcodec:h264,proto:m3u8,acodec:aac"
 

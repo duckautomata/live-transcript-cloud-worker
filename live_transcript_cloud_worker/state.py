@@ -2,12 +2,17 @@
 
 Layout under ``tmp/{key}/``:
 
-    meta.json          stream metadata (atomic)
-    transcript.jsonl   append-only log, one JSON record per line (docs/07 §2)
-    queue/             pending media uploads: {stream_id}__{line_id:06d}.ts
-    segments/          live capture segment output (transient)
-    ytdlp.log          yt-dlp stderr, tail-truncated
-    stream_stats.log   raw probe output, tail-truncated
+    meta.json                    stream metadata (atomic)
+    transcript.jsonl             append-only log, one JSON record per line (docs/07 §2)
+    queue/                       pending media uploads: {stream_id}__{line_id:06d}.ts
+    segments/                    capture work dirs, one per capture run: live-edge
+                                 segments, YouTube timeline chunks (transient)
+    ytdlp.log                    live-edge yt-dlp/ffmpeg stderr, tail-truncated
+    youtube_timeline.log         YouTube timeline run log: yt-dlp resolve output,
+                                 reconnects, gaps, run summaries; tail-truncated
+    youtube_timeline_state.json  YouTube timeline resume point: the next sequence
+                                 of the stream last captured (atomic)
+    stream_stats.log             raw probe output, tail-truncated
 
 Each ``ChannelState`` is owned by exactly one task; nothing here is
 thread-safe and nothing needs to be.
@@ -307,3 +312,31 @@ class ChannelState:
                     path.unlink()
             except OSError as exc:
                 logger.warning("[%s] could not remove segment %s: %s", self.key, path, exc)
+
+    def remove_legacy_dash_files(self) -> None:
+        """Delete what the removed DASH capture left behind.
+
+        ``fragments/`` kept a stream's leftover fragment files until the next
+        stream started, and ``dash_state.json`` is a resume point nothing
+        reads any more; without this both would sit in the channel dir
+        forever. Called at worker boot, next to clear_segments_dir.
+        """
+        removed: list[str] = []
+        fragments = self.root / "fragments"
+        if fragments.is_dir():
+            try:
+                shutil.rmtree(fragments)
+                removed.append("fragments/")
+            except OSError as exc:
+                logger.warning("[%s] could not remove old DASH fragments %s: %s", self.key, fragments, exc)
+        for name in ("dash_state.json", "dash_state.json.tmp"):
+            path = self.root / name
+            try:
+                path.unlink()
+                removed.append(name)
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("[%s] could not remove old DASH state %s: %s", self.key, path, exc)
+        if removed:
+            logger.info("[%s] removed leftovers of the old DASH capture: %s", self.key, ", ".join(removed))

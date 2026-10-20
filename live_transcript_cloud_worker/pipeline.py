@@ -194,15 +194,23 @@ class StreamPipeline:
                 line.id,
             )
 
-        latency = time.time() - (chunk.audio_start_time + chunk.duration)
+        if chunk.lag_from is not None:
+            # A stamp from the stream's clock (see Chunk.lag_from): measure the
+            # backlog from when the capture produced the chunk instead.
+            latency = time.time() - chunk.lag_from
+            measured_from = "since capture"
+        else:
+            latency = time.time() - (chunk.audio_start_time + chunk.duration)
+            measured_from = "behind the audio edge"
         post_ms = (time.monotonic() - started) * 1000
         log = logger.warning if latency > LINE_LATENCY_WARN_SECONDS else logger.debug
         log(
-            "[%s] line %d posted in %.0fms, %.1fs behind the audio edge",
+            "[%s] line %d posted in %.0fms, %.1fs %s",
             chunk.key,
             line.id,
             post_ms,
             latency,
+            measured_from,
         )
 
         wants_media = chunk.media_type is not MediaType.NONE and chunk.stream_id == self.state.stream_id
